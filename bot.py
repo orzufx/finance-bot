@@ -202,7 +202,7 @@ def save_transaction(user_name, trans_type, payment_method, category,
     conn = get_conn()
     c = conn.cursor()
     if created_at is None:
-        created_at = datetime.now().isoformat()
+        created_at = datetime.now(UTC5).isoformat()
     c.execute(
         "INSERT INTO transactions "
         "(user_name, type, payment_method, category, amount, comment, created_at) "
@@ -216,7 +216,7 @@ def save_transaction(user_name, trans_type, payment_method, category,
 def get_summary(user_name: str, period: str) -> dict:
     conn = get_conn()
     c = conn.cursor()
-    now = datetime.now()
+    now = datetime.now(UTC5)
     if period == "today":
         since = now.strftime("%Y-%m-%d")
         rows = c.execute(
@@ -251,7 +251,7 @@ def get_transactions_for_period(user_name: str, period: str) -> list:
     """Returns list of (type, payment_method, category, amount, comment, created_at)."""
     conn = get_conn()
     c = conn.cursor()
-    now = datetime.now()
+    now = datetime.now(UTC5)
     if period == "today":
         since = now.strftime("%Y-%m-%d")
         rows = c.execute(
@@ -298,7 +298,7 @@ def add_card(user_name: str, card_name: str, card_number: str, balance: float):
     c.execute(
         "INSERT INTO cards (user_name, card_name, card_number, balance, created_at) "
         "VALUES (?,?,?,?,?)",
-        (user_name, card_name, card_number, balance, datetime.now().isoformat()),
+        (user_name, card_name, card_number, balance, datetime.now(UTC5).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -410,7 +410,7 @@ def get_today_transactions_all(target_date: str = None) -> dict:
     """Returns {user_name: [(type, payment, category, amount, comment), ...]}."""
     conn = get_conn()
     c = conn.cursor()
-    date_key = target_date if target_date else datetime.now().strftime("%Y-%m-%d")
+    date_key = target_date if target_date else datetime.now(UTC5).strftime("%Y-%m-%d")
     rows = c.execute(
         "SELECT user_name, type, payment_method, category, amount, comment "
         "FROM transactions WHERE created_at LIKE ? ORDER BY user_name, created_at",
@@ -436,7 +436,7 @@ def build_channel_text(is_evening: bool = False, target_date: str = None) -> str
         except Exception:
             display_date = target_date
     else:
-        display_date = datetime.now().strftime("%d.%m.%Y")
+        display_date = datetime.now(UTC5).strftime("%d.%m.%Y")
     icon  = "🌙" if is_evening else "🌅"
     title = "Yakuniy hisobot" if is_evening else "Kanal hisoboti"
     lines = [f"{icon} *{display_date} — {title}*\n"]
@@ -543,7 +543,7 @@ async def send_morning_message(context):
             chat_id=CHANNEL_ID, text=text, parse_mode="Markdown"
         )
         save_setting("ch_msg_id",   str(msg.message_id))
-        save_setting("ch_msg_date", datetime.now().strftime("%Y-%m-%d"))
+        save_setting("ch_msg_date", datetime.now(UTC5).strftime("%Y-%m-%d"))
         logger.info(f"[CHANNEL] Morning message sent: {msg.message_id}")
     except Exception as e:
         logger.error(f"[CHANNEL] Morning send failed: {e}")
@@ -552,7 +552,7 @@ async def send_morning_message(context):
 async def update_channel_message(bot, target_date: str = None):
     """Har tranzaksiyadan keyin kanal xabarini edit qiladi.
     Agar target_date bugundan farqli bo'lsa, o'sha kun uchun alohida xabar yuboradi."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(UTC5).strftime("%Y-%m-%d")
 
     # Boshqa kun uchun kiritilgan bo'lsa — alohida xabar yuboramiz
     if target_date and target_date != today:
@@ -600,7 +600,7 @@ async def send_evening_summary(context):
     # 1) Ertalabki xabarni o'chirish
     msg_id   = get_setting("ch_msg_id")
     msg_date = get_setting("ch_msg_date")
-    today    = datetime.now().strftime("%Y-%m-%d")
+    today    = datetime.now(UTC5).strftime("%Y-%m-%d")
     if msg_id and msg_date == today:
         try:
             await context.bot.delete_message(
