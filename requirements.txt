@@ -1,3 +1,5 @@
 python-telegram-bot[job-queue]==21.9
 pytz==2026.1.post1
 psycopg2-binary==2.9.9
+flask==3.1.0
+gunicorn==23.0.0

@@ -22,7 +22,7 @@ def migrate():
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-    pg_conn = psycopg2.connect(db_url, sslmode='require')
+    pg_conn = psycopg2.connect(db_url)
     pg_cursor = pg_conn.cursor()
 
     # 3. Read & Write Settings

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Finance Dashboard</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Full-screen loader -->
+    <div id="loader" class="loader-overlay">
+        <div class="spinner"></div>
+        <p>Yuklanmoqda...</p>
+    </div>
+
+    <!-- MAIN DASHBOARD -->
+    <main id="tab-dashboard" class="tab-content active">
+        <div class="header">
+            <h1 id="user-greeting">Salom!</h1>
+            <p>Umumiy hisobingiz holati</p>
+        </div>
+
+        <div class="balance-card total">
+            <span class="card-title">Jami Mablag'</span>
+            <h2 id="dash-total-balance">0 so'm</h2>
+        </div>
+
+        <div class="balance-grid">
+            <div class="balance-card avo">
+                <span class="icon">🏛</span>
+                <div>
+                    <span class="card-title">AVO (Umumiy)</span>
+                    <h3 id="dash-avo-balance">0 so'm</h3>
+                </div>
+            </div>
+            <div class="balance-card naqd">
+                <span class="icon">💵</span>
+                <div>
+                    <span class="card-title">Naqd pul</span>
+                    <h3 id="dash-naqd-balance">0 so'm</h3>
+                </div>
+            </div>
+        </div>
+
+        <section class="section cards-section">
+            <div class="section-header">
+                <h3>KARTALARIM</h3>
+            </div>
+            <div id="dash-cards-list" class="cards-list">
+                <!-- Cards injected here -->
+            </div>
+        </section>
+
+        <section class="section today-stats">
+            <div class="section-header">
+                <h3>BUGUNGI HOLAT</h3>
+            </div>
+            <div class="stats-row">
+                <div class="stat-box income">
+                    <span class="icon">↓</span>
+                    <div>
+                        <span class="label">Kirim</span>
+                        <h4 id="dash-today-income">0 so'm</h4>
+                    </div>
+                </div>
+                <div class="stat-box expense">
+                    <span class="icon">↑</span>
+                    <div>
+                        <span class="label">Harajat</span>
+                        <h4 id="dash-today-expense">0 so'm</h4>
+                    </div>
+                </div>
+            </div>
+        </section>
+        
+        <div class="spacer"></div>
+    </main>
+
+    <!-- ADD TRANSACTION -->
+    <main id="tab-add" class="tab-content">
+        <div class="header">
+            <h1>Yangi Tranzaksiya</h1>
+        </div>
+
+        <form id="add-form" class="transaction-form">
+            <div class="type-toggle">
+                <input type="radio" id="type-expense" name="type" value="harajat" checked>
+                <label for="type-expense" class="toggle-btn expense">Harajat</label>
+                
+                <input type="radio" id="type-income" name="type" value="kirim">
+                <label for="type-income" class="toggle-btn income">Kirim</label>
+            </div>
+
+            <div class="input-group amount-group">
+                <input type="number" id="amount" placeholder="0" inputmode="numeric" required>
+                <span class="currency">so'm</span>
+            </div>
+
+            <div class="input-group">
+                <label>To'lov usuli</label>
+                <div class="custom-select">
+                    <select id="payment-method" required>
+                        <option value="🏛 AVO">🏛 AVO (Umumiy)</option>
+                        <option value="💵 Naqd">💵 Naqd pul</option>
+                        <!-- Cards added dynamically -->
+                    </select>
+                </div>
+            </div>
+
+            <div class="input-group">
+                <label>Kategoriya</label>
+                <div class="custom-select">
+                    <select id="category" required>
+                        <!-- Added dynamically -->
+                    </select>
+                </div>
+            </div>
+
+            <div class="input-group">
+                <label>Izoh (ixtiyoriy)</label>
+                <input type="text" id="comment" placeholder="Nima uchun...">
+            </div>
+
+            <button type="submit" class="submit-btn" id="submit-btn">Saqlash</button>
+        </form>
+        <div class="spacer"></div>
+    </main>
+
+    <!-- STATISTICS -->
+    <main id="tab-stats" class="tab-content">
+        <div class="header">
+            <h1>Statistika</h1>
+            <div class="period-toggle">
+                <button class="period-btn active" data-period="week">Hafta</button>
+                <button class="period-btn" data-period="month">Oy</button>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h3>Kirim / Harajat</h3>
+            <canvas id="barChart"></canvas>
+        </div>
+
+        <div class="chart-container">
+            <h3>Harajat Kategoriyalari</h3>
+            <canvas id="donutChart"></canvas>
+        </div>
+        <div class="spacer"></div>
+    </main>
+
+    <!-- BOTTOM NAVIGATION -->
+    <nav class="bottom-nav">
+        <button class="nav-btn active" data-target="tab-dashboard">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+            <span>Asosiy</span>
+        </button>
+        <button class="nav-btn add-btn" data-target="tab-add">
+            <div class="fab">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            </div>
+        </button>
+        <button class="nav-btn" data-target="tab-stats">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
+            <span>Statistika</span>
+        </button>
+    </nav>
+
+    <script src="app.js"></script>
+</body>
+</html>

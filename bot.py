@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime, timedelta, time as dt_time, timezone, timedelta as td
 from datetime import timezone as tz
 import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,8 +32,8 @@ UTC5       = pytz.timezone("Asia/Tashkent")   # Toshkent vaqti
 
 # ─── Conversation States ─────────────────────────────────────────────────────
 (
-    LANG_SELECT,
-    USER_SELECT,
+    REGISTER_NAME,
+    _UNUSED_STATE_1,
     MAIN_MENU,
     ANOTHER_DATE_INPUT,       # "Boshqa kun" — sana kiritish
     ANOTHER_DATE_TYPE,        # Sana kiritilgandan keyin harajat/kirim tanlash
@@ -146,6 +146,13 @@ def init_db():
                 UNIQUE(user_name, wallet_type)
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
     else:
         # SQLite Schema
         c.execute("""
@@ -188,6 +195,13 @@ def init_db():
                 wallet_type TEXT    NOT NULL,
                 balance     REAL    NOT NULL DEFAULT 0,
                 UNIQUE(user_name, wallet_type)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
         """)
     
@@ -370,9 +384,6 @@ def payment_to_wallet_type(payment_method: str):
     return None
 
 
-def get_birgalikda_naqd() -> float:
-    """BIRGALIKDA naqdini ORZU + SHIRIN naqdidan hisoblaydi."""
-    return get_wallet_balance("ORZU", "naqd") + get_wallet_balance("SHIRIN", "naqd")
 
 
 def save_setting(key: str, value: str):
@@ -389,6 +400,52 @@ def get_setting(key: str):
     row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     conn.close()
     return row[0] if row else None
+
+
+def register_user(telegram_id: int, display_name: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
+              (f"user_{telegram_id}", display_name))
+    conn.commit()
+    conn.close()
+    # Also insert into users table
+    conn2 = get_conn()
+    c2 = conn2.cursor()
+    now_str = datetime.now(UTC5).isoformat()
+    if DATABASE_URL:
+        c2.execute(
+            "INSERT INTO users (telegram_id, display_name, created_at) VALUES (%s,%s,%s) "
+            "ON CONFLICT (telegram_id) DO UPDATE SET display_name = EXCLUDED.display_name",
+            (telegram_id, display_name, now_str),
+        )
+    else:
+        c2.execute(
+            "INSERT OR REPLACE INTO users (telegram_id, display_name, created_at) VALUES (?,?,?)",
+            (telegram_id, display_name, now_str),
+        )
+    conn2.commit()
+    conn2.close()
+    # Also ensure wallets exist
+    set_wallet_balance(display_name, "naqd", get_wallet_balance(display_name, "naqd"))
+
+
+def get_user_name(telegram_id: int) -> str:
+    """Returns display_name or None if not registered."""
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute("SELECT display_name FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_all_user_names() -> list:
+    """Returns list of all registered user display names."""
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute("SELECT display_name FROM users ORDER BY created_at").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 # ─── Channel Data Helpers ─────────────────────────────────────────────────────
@@ -424,7 +481,6 @@ def get_today_transactions_all(target_date: str = None) -> dict:
 
 
 # ─── Channel Message Builder ──────────────────────────────────────────────────
-ALL_USERS = ["ORZU", "SHIRIN", "BIRGALIKDA"]
 AVO_USER          = "SHARED"   # AVO barcha userlar uchun umumiy
 ALLOWED_USER_IDS  = {5701684264, 6392413373, 7064655656}
 
@@ -453,20 +509,12 @@ def build_channel_text(is_evening: bool = False, target_date: str = None) -> str
     lines.append("")
 
     # Har bir user uchun Naqd + kartalar
-    for user in ALL_USERS:
-        u_icon   = "👫" if user == "BIRGALIKDA" else "👤"
-        if user == "BIRGALIKDA":
-            naqd_bal     = get_birgalikda_naqd()
-            add_to_total = False
-        else:
-            naqd_bal     = get_wallet_balance(user, "naqd")
-            add_to_total = True
+    for user in get_all_user_names():
+        naqd_bal = get_wallet_balance(user, "naqd")
         cards = all_cards.get(user, [])
-        lines.append(f"{u_icon} *{user}*")
-        naqd_label = "Naqd (ORZU+SHIRIN)" if user == "BIRGALIKDA" else "Naqd"
-        lines.append(f"  ├ 💵 {naqd_label}  ➤  `{format_amount(naqd_bal)}`")
-        if add_to_total:
-            grand_balance += naqd_bal
+        lines.append(f"👤 *{user}*")
+        lines.append(f"  ├ 💵 Naqd  ➤  `{format_amount(naqd_bal)}`")
+        grand_balance += naqd_bal
         if not cards:
             lines.append("  └ 🏦 _karta yo'q_")
         else:
@@ -487,15 +535,14 @@ def build_channel_text(is_evening: bool = False, target_date: str = None) -> str
     grand_income  = 0
     any_txn       = False
 
-    for user in ALL_USERS:
+    for user in get_all_user_names():
         txns     = all_txns.get(user, [])
         expenses = [(p, c, a, cm) for t, p, c, a, cm in txns if t == "harajat"]
         incomes  = [(p, c, a, cm) for t, p, c, a, cm in txns if t == "kirim"]
         if not expenses and not incomes:
             continue
         any_txn = True
-        u_icon  = "👫" if user == "BIRGALIKDA" else "👤"
-        lines.append(f"{u_icon} *{user}*")
+        lines.append(f"👤 *{user}*")
         if expenses:
             user_exp = 0
             lines.append("📤 _Harajatlar:_")
@@ -720,15 +767,7 @@ PAYMENT_METHODS = {
     "en": ["🏛 AVO", "💳 Personal card", "💵 Cash"],
 }
 # BIRGALIKDA uchun ATTO yo'q
-PAYMENT_METHODS_BIRGALIKDA = {
-    "uz": ["🏛 AVO", "💳 Shaxsiy karta", "💵 Naqd"],
-    "en": ["🏛 AVO", "💳 Personal card", "💵 Cash"],
-}
 
-EXPENSE_CATEGORIES_BIRGALIKDA = {
-    "uz": ["🛒 Korzinka", "🏪 Mini market", "🍽 Ovqatlanish", "🛍 Bozor", "💸 Qarz", "🏦 Kredit", "📦 Boshqa"],
-    "en": ["🛒 Korzinka", "🏪 Mini market", "🍽 Dining", "🛍 Bazaar", "💸 Debt", "🏦 Credit", "📦 Other"],
-}
 
 EXPENSE_CATEGORIES = {
     "uz": ["🛒 Korzinka", "🏪 Mini market", "🍽 Ovqatlanish", "🛍 Bozor", "💸 Qarz", "🏦 Kredit", "🚌 ATTO", "📦 Boshqa"],
@@ -884,49 +923,22 @@ def build_detailed_report(user_name: str, period: str, period_label: str, ctx) -
 
 def build_cards_text(user_name: str, ctx) -> str:
     l     = lang(ctx)
-    title = f"💳 *{TEXTS[l]['cards_menu']}*\n👫 {user_name}\n\n" if user_name == "BIRGALIKDA" else f"💳 *{TEXTS[l]['cards_menu']}*\n👤 {user_name}\n\n"
+    title = f"💳 *{TEXTS[l]['cards_menu']}*\n👤 {user_name}\n\n"
 
-    # ── Hamyon
-    avo_bal  = get_wallet_balance(AVO_USER, "avo")   # umumiy
-    if user_name == "BIRGALIKDA":
-        naqd_bal   = get_birgalikda_naqd()
-        naqd_label = "Naqd (ORZU+SHIRIN)"
-        wallet_lines = (
-            f"🏛 *AVO (umumiy):*  `{format_amount(avo_bal)}`\n"
-            f"💵 *{naqd_label}:*  `{format_amount(naqd_bal)}`"
+    naqd_bal = get_wallet_balance(user_name, "naqd")
+    wallet_lines = (
+        f"💵 *Naqd:*          `{format_amount(naqd_bal)}`"
+    )
+    total = naqd_bal
+    cards = get_cards(user_name)
+    lines = []
+    for card_id, name, number, balance in cards:
+        num_str = f" · `{mask_number(number)}`" if number else ""
+        lines.append(
+            f"┌─ 🏦 *{name}*{num_str}\n"
+            f"└─ 💰 `{format_amount(balance)}`"
         )
-        total = avo_bal + naqd_bal
-        # BIRGALIKDA uchun barcha userlar kartalarini ko'rsat
-        lines = []
-        for owner in ["ORZU", "SHIRIN", "BIRGALIKDA"]:
-            owner_cards = get_cards(owner)
-            if not owner_cards:
-                continue
-            o_icon = "👫" if owner == "BIRGALIKDA" else "👤"
-            for card_id, name, number, balance in owner_cards:
-                num_str = f" · `{mask_number(number)}`" if number else ""
-                lines.append(
-                    f"┌─ {o_icon} *{owner}* · 🏦 *{name}*{num_str}\n"
-                    f"└─ 💰 `{format_amount(balance)}`"
-                )
-                total += balance
-        cards = lines  # non-empty check uchun
-    else:
-        naqd_bal = get_wallet_balance(user_name, "naqd")
-        wallet_lines = (
-            f"🏛 *AVO (umumiy):*  `{format_amount(avo_bal)}`\n"
-            f"💵 *Naqd:*          `{format_amount(naqd_bal)}`"
-        )
-        total = avo_bal + naqd_bal
-        cards = get_cards(user_name)
-        lines = []
-        for card_id, name, number, balance in cards:
-            num_str = f" · `{mask_number(number)}`" if number else ""
-            lines.append(
-                f"┌─ 🏦 *{name}*{num_str}\n"
-                f"└─ 💰 `{format_amount(balance)}`"
-            )
-            total += balance
+        total += balance
 
     footer = (
         f"\n\n━━━━━━━━━━━━━━━━━━━━━━"
@@ -941,60 +953,43 @@ def build_cards_text(user_name: str, ctx) -> str:
 
 
 # ─── Keyboards ───────────────────────────────────────────────────────────────
-def kb_lang():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇺🇿  O'zbek",  callback_data="lang_uz"),
-         InlineKeyboardButton("🇬🇧  English", callback_data="lang_en")],
-    ])
-
-
-def kb_users():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤  ORZU",        callback_data="user_ORZU"),
-         InlineKeyboardButton("👤  SHIRIN",      callback_data="user_SHIRIN")],
-        [InlineKeyboardButton("👫  Birgalikda",  callback_data="user_BIRGALIKDA")],
-    ])
-
-
 def kb_main(ctx):
     l         = lang(ctx)
     user_name = ctx.user_data.get("user_name", "")
+    web_app_url = "https://orzufx-finance-bot-7c73cc00efed.herokuapp.com"
     if l == "uz":
         rows = [
+            [InlineKeyboardButton("📊  Web Dashboard (Yangi!)", web_app=WebAppInfo(url=web_app_url))],
             [InlineKeyboardButton("💸  Harajat", callback_data="menu_expense"),
              InlineKeyboardButton("💰  Kirim",   callback_data="menu_income")],
             [InlineKeyboardButton("📅  Boshqa kun uchun kiritish", callback_data="menu_another_date")],
             [InlineKeyboardButton("💳  Kartalarim", callback_data="menu_cards")],
+            [InlineKeyboardButton("🔄  O'tkazma (Transfer)", callback_data="menu_transfer")],
             [InlineKeyboardButton("📈  Bugun", callback_data="report_today"),
              InlineKeyboardButton("📊  Hafta", callback_data="report_week"),
              InlineKeyboardButton("📆  Oy",    callback_data="report_month")],
-            [InlineKeyboardButton("👤  Foydalanuvchi", callback_data="change_user"),
-             InlineKeyboardButton("🌐  Til",            callback_data="change_language")],
+            [InlineKeyboardButton("🌐  Til", callback_data="change_language")],
         ]
-        if user_name == "BIRGALIKDA":
-            rows.insert(2, [InlineKeyboardButton("🔄  Kartalar o'rtasida o'tkazma", callback_data="menu_transfer")])
     else:
         rows = [
+            [InlineKeyboardButton("📊  Web Dashboard (New!)", web_app=WebAppInfo(url=web_app_url))],
             [InlineKeyboardButton("💸  Expense", callback_data="menu_expense"),
              InlineKeyboardButton("💰  Income",  callback_data="menu_income")],
             [InlineKeyboardButton("📅  Add for another date", callback_data="menu_another_date")],
             [InlineKeyboardButton("💳  My Cards", callback_data="menu_cards")],
+            [InlineKeyboardButton("🔄  Transfer", callback_data="menu_transfer")],
             [InlineKeyboardButton("📈  Today", callback_data="report_today"),
              InlineKeyboardButton("📊  Week",  callback_data="report_week"),
              InlineKeyboardButton("📆  Month", callback_data="report_month")],
-            [InlineKeyboardButton("👤  Change user", callback_data="change_user"),
-             InlineKeyboardButton("🌐  Language",    callback_data="change_language")],
+            [InlineKeyboardButton("🌐  Language", callback_data="change_language")],
         ]
-        if user_name == "BIRGALIKDA":
-            rows.insert(2, [InlineKeyboardButton("🔄  Transfer between cards", callback_data="menu_transfer")])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_payment_methods(ctx, prefix: str):
-    """To'lov usuli — BIRGALIKDA uchun ATTO yo'q."""
-    user_name = ctx.user_data.get("user_name", "")
+    """To'lov usuli."""
     l         = lang(ctx)
-    methods   = PAYMENT_METHODS_BIRGALIKDA[l] if user_name == "BIRGALIKDA" else PAYMENT_METHODS[l]
+    methods   = PAYMENT_METHODS[l]
     row = [InlineKeyboardButton(m, callback_data=f"{prefix}{m}") for m in methods]
     return InlineKeyboardMarkup([
         row,
@@ -1003,31 +998,24 @@ def kb_payment_methods(ctx, prefix: str):
 
 
 def kb_all_cards_for_transfer(ctx, exclude_card_id=None):
-    """Barcha userlarning kartalarini ko'rsatadi (o'tkazma uchun)."""
+    """Faqat joriy foydalanuvchi kartalarini ko'rsatadi (o'tkazma uchun)."""
+    user_name = ctx.user_data.get("user_name", "")
     buttons = []
-    for owner in ["ORZU", "SHIRIN", "BIRGALIKDA"]:
-        cards = get_cards(owner)
-        if not cards:
+    cards = get_cards(user_name)
+    for card_id, name, number, balance in cards:
+        if card_id == exclude_card_id:
             continue
-        u_icon = "👫" if owner == "BIRGALIKDA" else "👤"
-        for card_id, name, number, balance in cards:
-            if card_id == exclude_card_id:
-                continue
-            num_str = f" ({mask_number(number)})" if number else ""
-            label   = f"{u_icon} {owner} · 🏦 {name}{num_str} — {format_amount(balance)}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"trf_card_{card_id}")])
+        num_str = f" ({mask_number(number)})" if number else ""
+        label   = f"🏦 {name}{num_str} — {format_amount(balance)}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"trf_card_{card_id}")])
     buttons.append([InlineKeyboardButton(t("back", ctx), callback_data="menu_back_main")])
     return InlineKeyboardMarkup(buttons)
 
 
 def kb_expense_categories(ctx):
-    """2 categories per row; ATTO faqat ORZU va SHIRIN uchun ko'rinadi."""
-    user_name = ctx.user_data.get("user_name", "")
+    """2 categories per row."""
     l = lang(ctx)
-    if user_name == "BIRGALIKDA":
-        cats = EXPENSE_CATEGORIES_BIRGALIKDA[l]
-    else:
-        cats = EXPENSE_CATEGORIES[l]
+    cats = EXPENSE_CATEGORIES[l]
     buttons = []
     for i in range(0, len(cats), 2):
         row = [InlineKeyboardButton(cats[i], callback_data=f"exp_cat_{cats[i]}")]
@@ -1053,25 +1041,11 @@ def kb_income_categories(ctx):
 
 def kb_select_payment_card(user_name: str, ctx):
     buttons = []
-
-    if user_name == "BIRGALIKDA":
-        # BIRGALIKDA uchun barcha userlarning kartalarini ko'rsat
-        for owner in ["ORZU", "SHIRIN", "BIRGALIKDA"]:
-            cards = get_cards(owner)
-            if not cards:
-                continue
-            owner_icon = "👫" if owner == "BIRGALIKDA" else "👤"
-            for card_id, name, number, balance in cards:
-                num_str = f" ({mask_number(number)})" if number else ""
-                label   = f"{owner_icon} {owner} · 🏦 {name}{num_str} — {format_amount(balance)}"
-                buttons.append([InlineKeyboardButton(label, callback_data=f"paycard_{card_id}")])
-    else:
-        cards = get_cards(user_name)
-        for card_id, name, number, balance in cards:
-            num_str = f" ({mask_number(number)})" if number else ""
-            label   = f"🏦 {name}{num_str} — {format_amount(balance)}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"paycard_{card_id}")])
-
+    cards = get_cards(user_name)
+    for card_id, name, number, balance in cards:
+        num_str = f" ({mask_number(number)})" if number else ""
+        label   = f"🏦 {name}{num_str} — {format_amount(balance)}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"paycard_{card_id}")])
     buttons.append([InlineKeyboardButton(t("back", ctx), callback_data="paycard_back")])
     return InlineKeyboardMarkup(buttons)
 
@@ -1096,36 +1070,16 @@ def kb_cards_menu(user_name: str, ctx):
     l        = lang(ctx)
     avo_bal  = get_wallet_balance(AVO_USER, "avo")   # umumiy
     avo_lbl  = f"🏛 AVO (umumiy) — {format_amount(avo_bal)}"
-
-    if user_name == "BIRGALIKDA":
-        naqd_bal = get_birgalikda_naqd()
-        naqd_lbl = f"💵 Naqd (ORZU+SHIRIN) — {format_amount(naqd_bal)}"
-        buttons  = [
-            [InlineKeyboardButton(avo_lbl,  callback_data="wallet_edit_avo"),
-             InlineKeyboardButton(naqd_lbl, callback_data="wallet_info_naqd")],
-        ]
-    else:
-        naqd_bal = get_wallet_balance(user_name, "naqd")
-        naqd_lbl = f"💵 {'Naqd' if l == 'uz' else 'Cash'} — {format_amount(naqd_bal)}"
-        buttons  = [
-            [InlineKeyboardButton(avo_lbl,  callback_data="wallet_edit_avo"),
-             InlineKeyboardButton(naqd_lbl, callback_data="wallet_edit_naqd")],
-        ]
-
-    if user_name == "BIRGALIKDA":
-        # ORZU, SHIRIN, BIRGALIKDA kartalarini ko'rsat
-        for owner in ["ORZU", "SHIRIN", "BIRGALIKDA"]:
-            owner_cards = get_cards(owner)
-            o_icon = "👫" if owner == "BIRGALIKDA" else "👤"
-            for card_id, name, number, balance in owner_cards:
-                num_str = f" ({mask_number(number)})" if number else ""
-                label   = f"{o_icon} {owner} · 🏦 {name}{num_str} — {format_amount(balance)}"
-                buttons.append([InlineKeyboardButton(label, callback_data=f"card_select_{card_id}")])
-    else:
-        for card_id, name, number, balance in get_cards(user_name):
-            num_str = f" ({mask_number(number)})" if number else ""
-            label   = f"🏦 {name}{num_str} — {format_amount(balance)}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"card_select_{card_id}")])
+    naqd_bal = get_wallet_balance(user_name, "naqd")
+    naqd_lbl = f"💵 {'Naqd' if l == 'uz' else 'Cash'} — {format_amount(naqd_bal)}"
+    buttons  = [
+        [InlineKeyboardButton(avo_lbl,  callback_data="wallet_edit_avo"),
+         InlineKeyboardButton(naqd_lbl, callback_data="wallet_edit_naqd")],
+    ]
+    for card_id, name, number, balance in get_cards(user_name):
+        num_str = f" ({mask_number(number)})" if number else ""
+        label   = f"🏦 {name}{num_str} — {format_amount(balance)}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"card_select_{card_id}")])
     buttons.append([InlineKeyboardButton(t("add_card", ctx), callback_data="card_add")])
     buttons.append([InlineKeyboardButton(t("back", ctx),     callback_data="menu_back_main")])
     return InlineKeyboardMarkup(buttons)
@@ -1149,51 +1103,39 @@ def kb_delete_confirm(card_id: int, ctx):
 # ─── Handlers ────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
-    await update.message.reply_text(
-        "🏦 *Finance Bot*\n\n"
-        "Assalomu alaykum! / Hello!\n"
-        "────────────────────\n"
-        "Iltimos tilni tanlang\n"
-        "Please choose language:",
-        parse_mode="Markdown",
-        reply_markup=kb_lang(),
-    )
-    return LANG_SELECT
+    ctx.user_data["lang"] = "uz"
+    
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Kechirasiz, siz ushbu botdan foydalana olmaysiz.")
+        return ConversationHandler.END
 
-
-async def cb_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chosen = query.data.split("_")[1]
-    ctx.user_data["lang"] = chosen
-
-    # If already logged in → go back to main menu, no need to re-select user
-    user_name = ctx.user_data.get("user_name")
+    user_name = get_user_name(user_id)
     if user_name:
-        await query.edit_message_text(
-            f"*{user_name}* — {t('main_menu', ctx)}",
+        ctx.user_data["user_name"] = user_name
+        await update.message.reply_text(
+            f"👤 *{user_name}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Xush kelibsiz! 🎉\n\n"
+            f"📋 Asosiy menyu",
             parse_mode="Markdown",
             reply_markup=kb_main(ctx),
         )
         return MAIN_MENU
 
-    await query.edit_message_text(t("who_are_you", ctx), reply_markup=kb_users())
-    return USER_SELECT
+    await update.message.reply_text("Xush kelibsiz! Iltimos, ismingizni kiriting (masalan: ORZU):")
+    return REGISTER_NAME
 
-
-async def cb_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chosen = query.data.split("_")[1]
-    ctx.user_data["user_name"] = chosen
-    l = lang(ctx)
-    greeting = "Xush kelibsiz" if l == "uz" else "Welcome"
-    menu_label = t("main_menu", ctx)
-    await query.edit_message_text(
-        f"👤 *{chosen}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{greeting}! 🎉\n\n"
-        f"📋 {menu_label}",
+async def msg_register_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    display_name = update.message.text.strip().upper()
+    
+    register_user(user_id, display_name)
+    ctx.user_data["user_name"] = display_name
+    
+    await update.message.reply_text(
+        f"✅ Muvaffaqiyatli ro'yxatdan o'tdingiz, *{display_name}*!\n\n"
+        f"📋 Asosiy menyu",
         parse_mode="Markdown",
         reply_markup=kb_main(ctx),
     )
@@ -1401,11 +1343,7 @@ async def cb_expense_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # If Shaxsiy karta → select which card
     if payment in CARD_PAYMENT_METHODS:
         user_name = ctx.user_data.get("user_name", "?")
-        # BIRGALIKDA uchun ORZU va SHIRIN kartalarini ham tekshir
-        if user_name == "BIRGALIKDA":
-            all_cards = [c for o in ["ORZU", "SHIRIN", "BIRGALIKDA"] for c in get_cards(o)]
-        else:
-            all_cards = get_cards(user_name)
+        all_cards = get_cards(user_name)
         if not all_cards:
             await query.edit_message_text(
                 f"💳 *{payment}* › 📂 *{category}*{date_note}\n\n"
@@ -1484,10 +1422,7 @@ async def cb_income_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Shaxsiy karta → qaysi kartaga tushdi?
     if payment in CARD_PAYMENT_METHODS:
         user_name = ctx.user_data.get("user_name", "?")
-        if user_name == "BIRGALIKDA":
-            all_cards = [c for o in ["ORZU", "SHIRIN", "BIRGALIKDA"] for c in get_cards(o)]
-        else:
-            all_cards = get_cards(user_name)
+        all_cards = get_cards(user_name)
         if not all_cards:
             await query.edit_message_text(
                 f"💰 *{payment}* › 📂 *{category}*{date_note}\n\n"
@@ -1600,9 +1535,7 @@ def _save_and_deduct(ctx, comment):
     if wallet_type and not card_id:
         delta  = amount if trans_type == "kirim" else -amount
         w_user = AVO_USER if wallet_type == "avo" else user_name
-        # BIRGALIKDA naqd = ORZU+SHIRIN yig'indisi, alohida saqlashsiz
-        if not (user_name == "BIRGALIKDA" and wallet_type == "naqd"):
-            adjust_wallet(w_user, wallet_type, delta)
+        adjust_wallet(w_user, wallet_type, delta)
 
     # custom_date ni _show_main_menu uchun saqlaymiz (kanal yangilanishi kerak)
     # _show_main_menu chaqirilgandan keyin o'chiriladi
