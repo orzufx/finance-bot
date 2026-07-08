@@ -956,7 +956,7 @@ def build_cards_text(user_name: str, ctx) -> str:
 def kb_main(ctx):
     l         = lang(ctx)
     user_name = ctx.user_data.get("user_name", "")
-    web_app_url = "https://orzu-finance-bot.herokuapp.com"
+    web_app_url = "https://orzu-finance-bot-ab68cb0dfc9f.herokuapp.com"
     if l == "uz":
         rows = [
             [InlineKeyboardButton("📊  Web Dashboard (Yangi!)", web_app=WebAppInfo(url=web_app_url))],
