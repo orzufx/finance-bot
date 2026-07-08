@@ -1975,6 +1975,15 @@ async def _post_init(application):
             logger.warning(f"[STARTUP] {user_id} ga yuborib bo'lmadi: {e}")
 
 
+async def error_handler(update, context):
+    import traceback
+    tb = traceback.format_exc()
+    logger.error(f"Exception while handling an update: {tb}")
+    try:
+        await context.bot.send_message(chat_id=7064655656, text=f"ERROR:\n{tb[-3900:]}")
+    except: pass
+
+
 def main():
     init_db()
     app = (
@@ -1983,6 +1992,7 @@ def main():
         .post_init(_post_init)
         .build()
     )
+    app.add_error_handler(error_handler)
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start, filters=filters.User(list(ALLOWED_USER_IDS)))],
