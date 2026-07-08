@@ -18,10 +18,33 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8607311771:AAHSFXsq9usGf4GxQcvhf-PNbB0I_vrf0X4")
 
+_pg_pool = None
+def get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None and DATABASE_URL:
+        from psycopg2.pool import ThreadedConnectionPool
+        _pg_pool = ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+    return _pg_pool
+
+class PostgresConnWrapper:
+    def __init__(self, conn):
+        self._conn = conn
+    def cursor(self):
+        return self._conn.cursor()
+    def commit(self):
+        self._conn.commit()
+    def rollback(self):
+        self._conn.rollback()
+    def close(self):
+        if DATABASE_URL:
+            get_pg_pool().putconn(self._conn)
+        else:
+            self._conn.close()
+
 def get_conn():
     if DATABASE_URL:
-        import psycopg2
-        return psycopg2.connect(DATABASE_URL, sslmode='require')
+        conn = get_pg_pool().getconn()
+        return PostgresConnWrapper(conn)
     else:
         return sqlite3.connect("finance.db")
 
