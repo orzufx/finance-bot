@@ -2,28 +2,27 @@ import os
 import json
 import hmac
 import hashlib
+import logging
 from urllib.parse import parse_qsl
 from flask import Flask, request, jsonify, send_from_directory
 from datetime import datetime, timedelta
 import pytz
 import sqlite3
-import urllib.parse
+
+from config import BOT_TOKEN, DATABASE_URL, ALLOWED_USER_IDS
 
 UTC5 = pytz.timezone("Asia/Tashkent")
 
 app = Flask(__name__, static_folder='webapp', static_url_path='')
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8607311771:AAHSFXsq9usGf4GxQcvhf-PNbB0I_vrf0X4")
 
 _pg_pool = None
 def get_pg_pool():
     global _pg_pool
     if _pg_pool is None and DATABASE_URL:
         from psycopg2.pool import ThreadedConnectionPool
-        _pg_pool = ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+        # bot.py + server.py birgalikda Heroku'ning 20 talik ulanish
+        # cheklovidan oshmasligi uchun har biriga maksimum 5 ta
+        _pg_pool = ThreadedConnectionPool(1, 5, DATABASE_URL, sslmode='require')
     return _pg_pool
 
 class PostgresConnWrapper:
@@ -47,6 +46,89 @@ def get_conn():
         return PostgresConnWrapper(conn)
     else:
         return sqlite3.connect("finance.db")
+
+def init_db():
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        if DATABASE_URL:
+            c.execute("""CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT UNIQUE NOT NULL,
+                display_name TEXT,
+                created_at TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS settings (
+                id SERIAL PRIMARY KEY,
+                key TEXT UNIQUE NOT NULL,
+                value TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS wallets (
+                id SERIAL PRIMARY KEY,
+                user_name TEXT NOT NULL,
+                wallet_type TEXT NOT NULL,
+                balance REAL DEFAULT 0,
+                UNIQUE(user_name, wallet_type)
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS cards (
+                id SERIAL PRIMARY KEY,
+                user_name TEXT NOT NULL,
+                card_name TEXT,
+                card_number TEXT,
+                balance REAL DEFAULT 0
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                user_name TEXT NOT NULL,
+                type TEXT,
+                payment_method TEXT,
+                category TEXT,
+                amount REAL,
+                comment TEXT,
+                created_at TEXT
+            )""")
+        else:
+            c.execute("""CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                display_name TEXT,
+                created_at TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE NOT NULL,
+                value TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS wallets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_name TEXT NOT NULL,
+                wallet_type TEXT NOT NULL,
+                balance REAL DEFAULT 0,
+                UNIQUE(user_name, wallet_type)
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_name TEXT NOT NULL,
+                card_name TEXT,
+                card_number TEXT,
+                balance REAL DEFAULT 0
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_name TEXT NOT NULL,
+                type TEXT,
+                payment_method TEXT,
+                category TEXT,
+                amount REAL,
+                comment TEXT,
+                created_at TEXT
+            )""")
+        conn.commit()
+    finally:
+        conn.close()
+
+init_db()
+
 
 def validate_telegram_data(init_data: str) -> dict:
     try:
@@ -78,8 +160,6 @@ def get_user_name(telegram_id):
     finally:
         conn.close()
 
-ALLOWED_USER_IDS = {5701684264, 6392413373, 7064655656}
-
 def require_auth(f):
     def wrapper(*args, **kwargs):
         auth_header = request.headers.get("Authorization")
@@ -98,8 +178,19 @@ def require_auth(f):
         user_name = get_user_name(telegram_id)
         if not user_name:
             user_name = user_data.get("first_name", "Foydalanuvchi")
-            from bot import register_user
-            register_user(telegram_id, user_name)
+            now_str = datetime.now(UTC5).isoformat()
+            conn2 = get_conn()
+            c2 = conn2.cursor()
+            try:
+                q_user = "INSERT INTO users (telegram_id, display_name, created_at) VALUES (%s, %s, %s) ON CONFLICT (telegram_id) DO UPDATE SET display_name = EXCLUDED.display_name" if DATABASE_URL else "INSERT INTO users (telegram_id, display_name, created_at) VALUES (?, ?, ?) ON CONFLICT (telegram_id) DO UPDATE SET display_name = EXCLUDED.display_name"
+                c2.execute(q_user, (telegram_id, user_name, now_str))
+                q_setting = "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value" if DATABASE_URL else "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                c2.execute(q_setting, (f'user_{telegram_id}', user_name))
+                q_wallet = "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (%s, %s, %s) ON CONFLICT (user_name, wallet_type) DO NOTHING" if DATABASE_URL else "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (?, ?, ?) ON CONFLICT (user_name, wallet_type) DO NOTHING"
+                c2.execute(q_wallet, (user_name, 'naqd', 0))
+                conn2.commit()
+            finally:
+                conn2.close()
             
         return f(user_name, *args, **kwargs)
     wrapper.__name__ = f.__name__
@@ -192,47 +283,70 @@ def stats(user_name):
 @app.route('/api/transaction', methods=['POST'])
 @require_auth
 def add_transaction(user_name):
-    data = request.json
+    data = request.get_json(silent=True) or {}
     trans_type = data.get('type')
-    payment_method = data.get('payment_method')
+    payment_method = data.get('payment_method') or ''
     category = data.get('category')
-    amount = float(data.get('amount', 0))
     comment = data.get('comment', '')
     card_id = data.get('card_id')
-    
+
+    try:
+        amount = float(data.get('amount') or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid amount"}), 400
     if amount <= 0:
         return jsonify({"error": "Invalid amount"}), 400
-        
+    if trans_type not in ("harajat", "kirim"):
+        return jsonify({"error": "Invalid type"}), 400
+    if not category:
+        return jsonify({"error": "Invalid category"}), 400
+
+    # Balans qayerdan o'zgarishini oldindan aniqlaymiz — aks holda
+    # tranzaksiya saqlanib, hech qanday balans o'zgarmay qolishi mumkin
+    wtype = None
+    if card_id is not None and str(card_id).strip():
+        if not str(card_id).isdigit():
+            return jsonify({"error": "Invalid card_id"}), 400
+        card_id = int(card_id)
+    else:
+        card_id = None
+        pm = payment_method.lower()
+        wtype = "avo" if "avo" in pm else ("naqd" if "naqd" in pm or "cash" in pm else None)
+        if wtype is None:
+            return jsonify({"error": f"Noma'lum to'lov usuli: {payment_method}"}), 400
+
     created_at = datetime.now(UTC5).isoformat()
-    
+
     conn = get_conn()
     c = conn.cursor()
     try:
         # Save transaction
         q_ins = "INSERT INTO transactions (user_name, type, payment_method, category, amount, comment, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)" if DATABASE_URL else "INSERT INTO transactions (user_name, type, payment_method, category, amount, comment, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
         c.execute(q_ins, (user_name, trans_type, payment_method, category, amount, comment, created_at))
-        
+
         # Adjust balances
         delta = amount if trans_type == "kirim" else -amount
-        
-        if card_id and str(card_id).isdigit():
+
+        if card_id is not None:
             q_upd_card = "UPDATE cards SET balance = balance + %s WHERE id = %s AND user_name = %s" if DATABASE_URL else "UPDATE cards SET balance = balance + ? WHERE id = ? AND user_name = ?"
             c.execute(q_upd_card, (delta, card_id, user_name))
+            if c.rowcount == 0:
+                conn.rollback()
+                return jsonify({"error": "Karta topilmadi"}), 404
         else:
-            wtype = "avo" if "avo" in payment_method.lower() else ("naqd" if "naqd" in payment_method.lower() or "cash" in payment_method.lower() else None)
-            if wtype:
-                w_user = "SHARED" if wtype == "avo" else user_name
-                q_upd_wallet = "UPDATE wallets SET balance = balance + %s WHERE user_name = %s AND wallet_type = %s" if DATABASE_URL else "UPDATE wallets SET balance = balance + ? WHERE user_name = ? AND wallet_type = ?"
-                c.execute(q_upd_wallet, (delta, w_user, wtype))
-                if c.rowcount == 0:
-                    q_ins_wallet = "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (%s, %s, %s)" if DATABASE_URL else "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (?, ?, ?)"
-                    c.execute(q_ins_wallet, (w_user, wtype, delta))
-                    
+            w_user = "SHARED" if wtype == "avo" else user_name
+            q_upd_wallet = "UPDATE wallets SET balance = balance + %s WHERE user_name = %s AND wallet_type = %s" if DATABASE_URL else "UPDATE wallets SET balance = balance + ? WHERE user_name = ? AND wallet_type = ?"
+            c.execute(q_upd_wallet, (delta, w_user, wtype))
+            if c.rowcount == 0:
+                q_ins_wallet = "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (%s, %s, %s)" if DATABASE_URL else "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (?, ?, ?)"
+                c.execute(q_ins_wallet, (w_user, wtype, delta))
+
         conn.commit()
         return jsonify({"success": True})
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        logging.exception("Transaction save failed")
+        return jsonify({"error": "Server xatosi"}), 500
     finally:
         conn.close()
 

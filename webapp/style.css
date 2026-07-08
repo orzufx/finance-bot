@@ -183,7 +183,7 @@ body {
 }
 .type-toggle input { display: none; }
 .toggle-btn {
-    flex: 1; text-align: center; padding: 10px; border-radius: 8px;
+    flex: 1; text-align: center; padding: 10px; border-radius: 8px; cursor: pointer;
     font-weight: 500; transition: 0.2s; color: var(--hint-color);
 }
 #type-expense:checked ~ .toggle-btn.expense { background: var(--expense-color); color: #fff; }
@@ -233,7 +233,7 @@ body {
 .chart-container h3 { font-size: 16px; margin-bottom: 16px; font-weight: 500; }
 .period-toggle { display: flex; background: var(--secondary-bg); border-radius: 10px; padding: 4px; }
 .period-btn {
-    flex: 1; padding: 6px; border: none; background: transparent;
+    flex: 1; padding: 6px; border: none; background: transparent; cursor: pointer;
     color: var(--hint-color); border-radius: 6px; font-family: var(--font-family);
     font-weight: 500; transition: 0.2s;
 }
@@ -242,14 +242,14 @@ body {
 /* Bottom Nav */
 .bottom-nav {
     position: fixed; bottom: 0; left: 0; right: 0;
-    height: 70px; background: rgba(33, 48, 64, 0.9);
+    height: 70px; background: var(--secondary-bg);
     backdrop-filter: blur(10px);
     border-top: 1px solid var(--card-border);
     display: flex; justify-content: space-around; align-items: center;
     padding-bottom: env(safe-area-inset-bottom); z-index: 100;
 }
 .nav-btn {
-    flex: 1; background: none; border: none;
+    flex: 1; background: none; border: none; cursor: pointer;
     color: var(--hint-color); display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 4px;
     font-family: var(--font-family); transition: 0.2s;

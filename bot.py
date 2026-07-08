@@ -1,7 +1,7 @@
 import logging
 import sqlite3
-from datetime import datetime, timedelta, time as dt_time, timezone, timedelta as td
-from datetime import timezone as tz
+import traceback
+from datetime import datetime, timedelta, time as dt_time, timezone
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
@@ -14,6 +14,8 @@ from telegram.ext import (
     ConversationHandler,
 )
 
+from config import BOT_TOKEN, DATABASE_URL, ALLOWED_USER_IDS, ADMIN_CHAT_ID
+
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -25,15 +27,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Bot Token ───────────────────────────────────────────────────────────────
-BOT_TOKEN  = "8607311771:AAHSFXsq9usGf4GxQcvhf-PNbB0I_vrf0X4"
+# ─── Bot sozlamalari ─────────────────────────────────────────────────────────
+# BOT_TOKEN, DATABASE_URL, ALLOWED_USER_IDS — config.py dan (env / .env)
 CHANNEL_ID = -1003863923798
 UTC5       = pytz.timezone("Asia/Tashkent")   # Toshkent vaqti
 
 # ─── Conversation States ─────────────────────────────────────────────────────
 (
     REGISTER_NAME,
-    _UNUSED_STATE_1,
     MAIN_MENU,
     ANOTHER_DATE_INPUT,       # "Boshqa kun" — sana kiritish
     ANOTHER_DATE_TYPE,        # Sana kiritilgandan keyin harajat/kirim tanlash
@@ -56,22 +57,19 @@ UTC5       = pytz.timezone("Asia/Tashkent")   # Toshkent vaqti
     TRANSFER_FROM,          # O'tkazma: qaysi kartadan
     TRANSFER_TO,            # O'tkazma: qaysi kartaga
     TRANSFER_AMOUNT,        # O'tkazma: miqdor
-) = range(23)
+) = range(22)
 
 
 # ─── Database Abstraction ────────────────────────────────────────────────────
-import os
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 _pg_pool = None
 def get_pg_pool():
     global _pg_pool
     if _pg_pool is None and DATABASE_URL:
         from psycopg2.pool import ThreadedConnectionPool
-        _pg_pool = ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+        # bot.py + server.py birgalikda Heroku'ning 20 talik ulanish
+        # cheklovidan oshmasligi uchun har biriga maksimum 5 ta
+        _pg_pool = ThreadedConnectionPool(1, 5, DATABASE_URL, sslmode='require')
     return _pg_pool
 
 class PostgresCursorWrapper:
@@ -111,7 +109,6 @@ def get_conn():
         conn = get_pg_pool().getconn()
         return PostgresConnWrapper(conn)
     else:
-        import sqlite3
         return sqlite3.connect("finance.db")
 
 def init_db():
@@ -381,9 +378,15 @@ def set_wallet_balance(user_name: str, wallet_type: str, balance: float):
 
 
 def adjust_wallet(user_name: str, wallet_type: str, delta: float):
-    """delta < 0 harajat, delta > 0 kirim uchun."""
-    current = get_wallet_balance(user_name, wallet_type)
-    set_wallet_balance(user_name, wallet_type, current + delta)
+    """delta < 0 harajat, delta > 0 kirim uchun. Atomik UPDATE."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE wallets SET balance = balance + ? WHERE user_name=? AND wallet_type=?",
+        (delta, user_name, wallet_type),
+    )
+    conn.commit()
+    conn.close()
 
 
 def payment_to_wallet_type(payment_method: str):
@@ -415,31 +418,34 @@ def get_setting(key: str):
 
 
 def register_user(telegram_id: int, display_name: str):
+    """Settings, users va naqd hamyonini bitta ulanish/tranzaksiyada yozadi."""
     conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
               (f"user_{telegram_id}", display_name))
-    conn.commit()
-    conn.close()
-    # Also insert into users table
-    conn2 = get_conn()
-    c2 = conn2.cursor()
     now_str = datetime.now(UTC5).isoformat()
     if DATABASE_URL:
-        c2.execute(
+        c.execute(
             "INSERT INTO users (telegram_id, display_name, created_at) VALUES (%s,%s,%s) "
             "ON CONFLICT (telegram_id) DO UPDATE SET display_name = EXCLUDED.display_name",
             (telegram_id, display_name, now_str),
         )
+        c.execute(
+            "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (%s,%s,0) "
+            "ON CONFLICT (user_name, wallet_type) DO NOTHING",
+            (display_name, "naqd"),
+        )
     else:
-        c2.execute(
+        c.execute(
             "INSERT OR REPLACE INTO users (telegram_id, display_name, created_at) VALUES (?,?,?)",
             (telegram_id, display_name, now_str),
         )
-    conn2.commit()
-    conn2.close()
-    # Also ensure wallets exist
-    set_wallet_balance(display_name, "naqd", get_wallet_balance(display_name, "naqd"))
+        c.execute(
+            "INSERT OR IGNORE INTO wallets (user_name, wallet_type, balance) VALUES (?,?,0)",
+            (display_name, "naqd"),
+        )
+    conn.commit()
+    conn.close()
 
 
 def get_user_name(telegram_id: int) -> str:
@@ -493,8 +499,7 @@ def get_today_transactions_all(target_date: str = None) -> dict:
 
 
 # ─── Channel Message Builder ──────────────────────────────────────────────────
-AVO_USER          = "SHARED"   # AVO barcha userlar uchun umumiy
-ALLOWED_USER_IDS  = {5701684264, 6392413373, 7064655656}
+AVO_USER = "SHARED"   # AVO barcha userlar uchun umumiy
 
 
 def build_channel_text(is_evening: bool = False, target_date: str = None) -> str:
@@ -778,7 +783,6 @@ PAYMENT_METHODS = {
     "uz": ["🏛 AVO", "💳 Shaxsiy karta", "💵 Naqd"],
     "en": ["🏛 AVO", "💳 Personal card", "💵 Cash"],
 }
-# BIRGALIKDA uchun ATTO yo'q
 
 
 EXPENSE_CATEGORIES = {
@@ -1112,6 +1116,13 @@ def kb_delete_confirm(card_id: int, ctx):
     ])
 
 
+def kb_back(ctx, callback_data: str = "menu_back_main"):
+    """Bitta '⬅️ Orqaga' tugmali klaviatura."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t("back", ctx), callback_data=callback_data)]
+    ])
+
+
 # ─── Handlers ────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
@@ -1166,6 +1177,7 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("custom_date_display", None)
         await query.edit_message_text(
             t("payment_method", ctx),
+            parse_mode="Markdown",
             reply_markup=kb_payment_methods(ctx, "exp_pay_"),
         )
         return EXPENSE_PAYMENT
@@ -1176,6 +1188,7 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("custom_date_display", None)
         await query.edit_message_text(
             t("payment_method", ctx),
+            parse_mode="Markdown",
             reply_markup=kb_payment_methods(ctx, "inc_pay_"),
         )
         return INCOME_PAYMENT
@@ -1194,7 +1207,10 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return TRANSFER_FROM
 
     elif data == "menu_another_date":
-        await query.edit_message_text(t("enter_date", ctx), parse_mode="Markdown")
+        back_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t("back", ctx), callback_data="menu_back_main")]
+        ])
+        await query.edit_message_text(t("enter_date", ctx), parse_mode="Markdown", reply_markup=back_btn)
         return ANOTHER_DATE_INPUT
 
     elif data == "menu_cards":
@@ -1231,17 +1247,20 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return MAIN_MENU
 
-    elif data == "change_user":
-        await query.edit_message_text(t("who_are_you", ctx), parse_mode="Markdown", reply_markup=kb_users())
-        return USER_SELECT
-
     elif data == "change_language":
+        current_lang = lang(ctx)
+        new_lang = "en" if current_lang == "uz" else "uz"
+        ctx.user_data["lang"] = new_lang
+        lang_name = "English 🇬🇧" if new_lang == "en" else "O'zbek 🇺🇿"
+        user_name = ctx.user_data.get("user_name", "?")
+        menu_label = TEXTS[new_lang]["main_menu"]
         await query.edit_message_text(
-            "🌐 *Tilni tanlang / Choose language:*",
+            f"🌐 Til o'zgartirildi: *{lang_name}*\n\n"
+            f"👤 *{user_name}*\n━━━━━━━━━━━━━━━━━━━━━━\n📋 {menu_label}",
             parse_mode="Markdown",
-            reply_markup=kb_lang(),
+            reply_markup=kb_main(ctx),
         )
-        return LANG_SELECT
+        return MAIN_MENU
 
     return MAIN_MENU
 
@@ -1251,7 +1270,9 @@ async def msg_another_date_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     date_str = update.message.text.strip()
     dt = parse_date(date_str)
     if not dt:
-        await update.message.reply_text(t("invalid_date", ctx), parse_mode="Markdown")
+        await update.message.reply_text(
+            t("invalid_date", ctx), parse_mode="Markdown", reply_markup=kb_back(ctx)
+        )
         return ANOTHER_DATE_INPUT
 
     ctx.user_data["custom_date"]         = dt.strftime("%Y-%m-%d")
@@ -1287,6 +1308,7 @@ async def cb_another_date_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["trans_type"] = "harajat"
         await query.edit_message_text(
             t("payment_method", ctx),
+            parse_mode="Markdown",
             reply_markup=kb_payment_methods(ctx, "exp_pay_"),
         )
         return EXPENSE_PAYMENT
@@ -1295,6 +1317,7 @@ async def cb_another_date_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["trans_type"] = "kirim"
         await query.edit_message_text(
             t("payment_method", ctx),
+            parse_mode="Markdown",
             reply_markup=kb_payment_methods(ctx, "inc_pay_"),
         )
         return INCOME_PAYMENT
@@ -1342,6 +1365,7 @@ async def cb_expense_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "back_to_expense_pay":
         await query.edit_message_text(
             t("payment_method", ctx),
+            parse_mode="Markdown",
             reply_markup=kb_payment_methods(ctx, "exp_pay_"),
         )
         return EXPENSE_PAYMENT
@@ -1378,6 +1402,7 @@ async def cb_expense_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"💳 *{payment}* › 📂 *{category}*{date_note}\n\n{t('enter_amount', ctx)}",
         parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "back_to_categories"),
     )
     return ENTER_AMOUNT
 
@@ -1421,6 +1446,7 @@ async def cb_income_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "back_to_income_pay":
         await query.edit_message_text(
             t("payment_method", ctx),
+            parse_mode="Markdown",
             reply_markup=kb_payment_methods(ctx, "inc_pay_"),
         )
         return INCOME_PAYMENT
@@ -1456,6 +1482,7 @@ async def cb_income_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"💰 *{payment}* › 📂 *{category}*{date_note}\n\n{t('enter_amount', ctx)}",
         parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "back_to_categories"),
     )
     return ENTER_AMOUNT
 
@@ -1468,11 +1495,21 @@ async def cb_select_payment_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     data = query.data
 
     if data == "paycard_back":
-        await query.edit_message_text(
-            t("expense_category", ctx),
-            reply_markup=kb_expense_categories(ctx),
-        )
-        return EXPENSE_CATEGORY
+        trans_type = ctx.user_data.get("trans_type", "harajat")
+        if trans_type == "kirim":
+            await query.edit_message_text(
+                t("income_category", ctx),
+                parse_mode="Markdown",
+                reply_markup=kb_income_categories(ctx),
+            )
+            return INCOME_CATEGORY
+        else:
+            await query.edit_message_text(
+                t("expense_category", ctx),
+                parse_mode="Markdown",
+                reply_markup=kb_expense_categories(ctx),
+            )
+            return EXPENSE_CATEGORY
 
     card_id  = int(data.split("paycard_")[1])
     ctx.user_data["expense_card_id"] = card_id
@@ -1489,21 +1526,65 @@ async def cb_select_payment_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         f"🏦 *{name}* — `{format_amount(balance)}`\n\n"
         f"{t('enter_amount', ctx)}",
         parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "back_to_categories"),
     )
     return ENTER_AMOUNT
 
 
 # ── Amount / Comment ──
+async def cb_amount_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """ENTER_AMOUNT dan kategoriya tanlashga qaytish."""
+    query = update.callback_query
+    await query.answer()
+    payment   = ctx.user_data.get("payment_method", "")
+    date_str  = ctx.user_data.get("custom_date_display", "")
+    date_note = f"\n📅 _{date_str}_" if date_str else ""
+
+    if ctx.user_data.get("trans_type") == "kirim":
+        await query.edit_message_text(
+            f"💰 *{payment}*{date_note}\n\n{t('income_category', ctx)}",
+            parse_mode="Markdown",
+            reply_markup=kb_income_categories(ctx),
+        )
+        return INCOME_CATEGORY
+
+    await query.edit_message_text(
+        f"💳 *{payment}*{date_note}\n\n{t('expense_category', ctx)}",
+        parse_mode="Markdown",
+        reply_markup=kb_expense_categories(ctx),
+    )
+    return EXPENSE_CATEGORY
+
+
+async def cb_comment_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Izoh bosqichidan summa kiritishga qaytish."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        t("enter_amount", ctx),
+        parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "back_to_categories"),
+    )
+    return ENTER_AMOUNT
+
+
 async def msg_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace(",", "").replace(" ", "")
     try:
         amount = float(text)
     except ValueError:
-        await update.message.reply_text(t("invalid_number", ctx))
+        await update.message.reply_text(
+            t("invalid_number", ctx),
+            reply_markup=kb_back(ctx, "back_to_categories"),
+        )
         return ENTER_AMOUNT
 
     ctx.user_data["amount"] = amount
-    await update.message.reply_text(t("enter_comment", ctx))
+    await update.message.reply_text(
+        t("enter_comment", ctx),
+        parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "back_to_amount"),
+    )
     return ENTER_COMMENT
 
 
@@ -1593,9 +1674,10 @@ async def _show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    current_lang = ctx.user_data.get("lang", "uz")
     ctx.user_data.clear()
     msg = ("❌ Bekor qilindi. /start ni bosing."
-           if lang(ctx) == "uz" else "❌ Cancelled. Press /start.")
+           if current_lang == "uz" else "❌ Cancelled. Press /start.")
     await update.message.reply_text(msg)
     return ConversationHandler.END
 
@@ -1674,8 +1756,44 @@ async def cb_transfer_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📥 _To:_   🏦 *{to_card[1]}*   `{format_amount(to_card[3])}`\n\n"
         f"💵 *Enter amount* (UZS):"
     )
-    await query.edit_message_text(text, parse_mode="Markdown")
+    await query.edit_message_text(
+        text, parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "trf_back_to_select"),
+    )
     return TRANSFER_AMOUNT
+
+
+async def cb_transfer_amount_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """TRANSFER_AMOUNT dan TO-karta tanlashga qaytish."""
+    query = update.callback_query
+    await query.answer()
+    from_card_id = ctx.user_data.get("trf_from_id")
+    from_card    = get_card_by_id(from_card_id) if from_card_id else None
+
+    if not from_card:
+        user_name = ctx.user_data.get("user_name", "?")
+        await query.edit_message_text(
+            f"👤 *{user_name}* — {t('main_menu', ctx)}",
+            parse_mode="Markdown",
+            reply_markup=kb_main(ctx),
+        )
+        return MAIN_MENU
+
+    l = lang(ctx)
+    text = (
+        f"🔄 *O'tkazma*\n"
+        f"📤 _Dan:_ 🏦 *{from_card[1]}*  `{format_amount(from_card[3])}`\n\n"
+        f"📥 _Qaysi kartaga_ o'tkazmoqchisiz?"
+        if l == "uz" else
+        f"🔄 *Transfer*\n"
+        f"📤 _From:_ 🏦 *{from_card[1]}*  `{format_amount(from_card[3])}`\n\n"
+        f"📥 _Which card_ to transfer TO?"
+    )
+    await query.edit_message_text(
+        text, parse_mode="Markdown",
+        reply_markup=kb_all_cards_for_transfer(ctx, exclude_card_id=from_card_id),
+    )
+    return TRANSFER_TO
 
 
 async def msg_transfer_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1684,7 +1802,10 @@ async def msg_transfer_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(text)
     except ValueError:
-        await update.message.reply_text(t("invalid_number", ctx))
+        await update.message.reply_text(
+            t("invalid_number", ctx),
+            reply_markup=kb_back(ctx, "trf_back_to_select"),
+        )
         return TRANSFER_AMOUNT
 
     from_id   = ctx.user_data.pop("trf_from_id", None)
@@ -1717,8 +1838,8 @@ async def msg_transfer_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Kanal xabarini yangilash
         try:
             await update_channel_message(update.get_bot())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[CHANNEL] Update skipped: {e}")
 
     user_name = ctx.user_data.get("user_name", "?")
     await update.message.reply_text(
@@ -1736,16 +1857,7 @@ async def cb_card_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data      = query.data
     user_name = ctx.user_data.get("user_name", "?")
 
-    if data == "wallet_info_naqd":
-        # BIRGALIKDA uchun: tahrirlash mumkin emas, faqat ma'lumot
-        combined = get_birgalikda_naqd()
-        await query.answer(
-            f"💵 Naqd (ORZU+SHIRIN): {format_amount(combined)}",
-            show_alert=True
-        )
-        return CARD_MENU
-
-    elif data.startswith("wallet_edit_"):
+    if data.startswith("wallet_edit_"):
         wtype   = data.split("wallet_edit_")[1]   # 'avo' or 'naqd'
         w_user  = AVO_USER if wtype == "avo" else user_name
         cur_bal = get_wallet_balance(w_user, wtype)
@@ -1761,11 +1873,17 @@ async def cb_card_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"\nCurrent balance: `{format_amount(cur_bal)}`"
             f"\n\n📝 *Enter new balance* (UZS):"
         )
-        await query.edit_message_text(prompt, parse_mode="Markdown")
+        await query.edit_message_text(
+            prompt, parse_mode="Markdown",
+            reply_markup=kb_back(ctx, "card_back_list"),
+        )
         return WALLET_EDIT
 
     elif data == "card_add":
-        await query.edit_message_text(t("card_add_name", ctx), parse_mode="Markdown")
+        await query.edit_message_text(
+            t("card_add_name", ctx), parse_mode="Markdown",
+            reply_markup=kb_back(ctx, "card_back_list"),
+        )
         return CARD_ADD_NAME
 
     elif data.startswith("card_select_"):
@@ -1803,20 +1921,29 @@ async def cb_card_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def msg_card_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     ctx.user_data["new_card_name"] = name
-    await update.message.reply_text(t("card_add_number", ctx), parse_mode="Markdown")
+    await update.message.reply_text(
+        t("card_add_number", ctx), parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "card_back_list"),
+    )
     return CARD_ADD_NUMBER
 
 
 async def msg_card_add_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     ctx.user_data["new_card_number"] = text
-    await update.message.reply_text(t("card_add_balance", ctx))
+    await update.message.reply_text(
+        t("card_add_balance", ctx), parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "card_back_list"),
+    )
     return CARD_ADD_BALANCE
 
 
 async def cmd_skip_card_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["new_card_number"] = ""
-    await update.message.reply_text(t("card_add_balance", ctx))
+    await update.message.reply_text(
+        t("card_add_balance", ctx), parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "card_back_list"),
+    )
     return CARD_ADD_BALANCE
 
 
@@ -1825,7 +1952,10 @@ async def msg_card_add_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         balance = float(text)
     except ValueError:
-        await update.message.reply_text(t("invalid_number", ctx))
+        await update.message.reply_text(
+            t("invalid_number", ctx),
+            reply_markup=kb_back(ctx, "card_back_list"),
+        )
         return CARD_ADD_BALANCE
 
     user_name = ctx.user_data.get("user_name", "unknown")
@@ -1842,6 +1972,10 @@ async def msg_card_add_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=kb_cards_menu(user_name, ctx),
     )
+    try:
+        await update_channel_message(ctx.bot)
+    except Exception as e:
+        logger.warning(f"[CHANNEL] Update skipped: {e}")
     return CARD_MENU
 
 
@@ -1860,6 +1994,7 @@ async def cb_card_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🏦 *{name}*\n\n{t('card_update_balance', ctx)}\n"
             f"_(Hozirgi: `{format_amount(card[3] if card else 0)}`)_",
             parse_mode="Markdown",
+            reply_markup=kb_back(ctx, "card_back_list"),
         )
         return CARD_UPDATE_BALANCE
 
@@ -1891,7 +2026,10 @@ async def msg_card_update_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     try:
         new_balance = float(text)
     except ValueError:
-        await update.message.reply_text(t("invalid_number", ctx))
+        await update.message.reply_text(
+            t("invalid_number", ctx),
+            reply_markup=kb_back(ctx, "card_back_list"),
+        )
         return CARD_UPDATE_BALANCE
 
     card_id = ctx.user_data.get("selected_card_id")
@@ -1908,6 +2046,10 @@ async def msg_card_update_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown",
         reply_markup=kb_cards_menu(user_name, ctx),
     )
+    try:
+        await update_channel_message(ctx.bot)
+    except Exception as e:
+        logger.warning(f"[CHANNEL] Update skipped: {e}")
     return CARD_MENU
 
 
@@ -1917,7 +2059,10 @@ async def msg_wallet_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         new_balance = float(text)
     except ValueError:
-        await update.message.reply_text(t("invalid_number", ctx))
+        await update.message.reply_text(
+            t("invalid_number", ctx),
+            reply_markup=kb_back(ctx, "card_back_list"),
+        )
         return WALLET_EDIT
 
     user_name = ctx.user_data.get("user_name", "?")
@@ -1936,6 +2081,10 @@ async def msg_wallet_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=kb_cards_menu(user_name, ctx),
     )
+    try:
+        await update_channel_message(ctx.bot)
+    except Exception as e:
+        logger.warning(f"[CHANNEL] Update skipped: {e}")
     return CARD_MENU
 
 
@@ -1953,6 +2102,10 @@ async def cb_card_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             parse_mode="Markdown",
             reply_markup=kb_cards_menu(user_name, ctx),
         )
+        try:
+            await update_channel_message(ctx.bot)
+        except Exception as e:
+            logger.warning(f"[CHANNEL] Update skipped: {e}")
         return CARD_MENU
 
     elif data == "card_back_list":
@@ -1988,15 +2141,30 @@ async def _post_init(application):
 
 
 async def error_handler(update, context):
-    import traceback
-    tb = traceback.format_exc()
-    logger.error(f"Exception while handling an update: {tb}")
+    err = context.error
+    if err is not None:
+        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    else:
+        tb = traceback.format_exc()
+    logger.error(f"Exception while handling an update:\n{tb}")
+    # Stack trace maxfiy ma'lumot (fayl yo'llari, DB URL) sizdirishi mumkin —
+    # chatga faqat qisqa xabar, to'liq matn logda qoladi
     try:
-        await context.bot.send_message(chat_id=7064655656, text=f"ERROR:\n{tb[-3900:]}")
-    except: pass
+        err_name = type(err).__name__ if err is not None else "Unknown"
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"⚠️ Botda xatolik: {err_name}\nBatafsil: finance_bot.log",
+        )
+    except Exception as notify_err:
+        logger.warning(f"[ERROR] Admin xabari yuborilmadi: {notify_err}")
 
 
 def main():
+    if not BOT_TOKEN:
+        raise SystemExit(
+            "BOT_TOKEN topilmadi! Uni .env fayliga yoki "
+            "Heroku Settings → Config Vars ga qo'shing."
+        )
     init_db()
     app = (
         Application.builder()
@@ -2020,6 +2188,7 @@ def main():
             ],
             ANOTHER_DATE_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_another_date_input),
+                CallbackQueryHandler(cb_main_menu, pattern="^menu_back_main$"),
             ],
             ANOTHER_DATE_TYPE: [
                 CallbackQueryHandler(
@@ -2056,27 +2225,32 @@ def main():
             ],
             ENTER_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_amount),
+                CallbackQueryHandler(cb_amount_back, pattern="^back_to_categories$"),
             ],
             ENTER_COMMENT: [
                 CommandHandler("skip", cmd_skip),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_comment),
+                CallbackQueryHandler(cb_comment_back, pattern="^back_to_amount$"),
             ],
             # Card states
             CARD_MENU: [
                 CallbackQueryHandler(
                     cb_card_menu,
-                    pattern="^(card_add$|card_select_|wallet_edit_|wallet_info_naqd$|menu_back_main$)",
+                    pattern="^(card_add$|card_select_|wallet_edit_|menu_back_main$)",
                 ),
             ],
             CARD_ADD_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_card_add_name),
+                CallbackQueryHandler(cb_card_action, pattern="^card_back_list$"),
             ],
             CARD_ADD_NUMBER: [
                 CommandHandler("skip", cmd_skip_card_number),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_card_add_number),
+                CallbackQueryHandler(cb_card_action, pattern="^card_back_list$"),
             ],
             CARD_ADD_BALANCE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_card_add_balance),
+                CallbackQueryHandler(cb_card_action, pattern="^card_back_list$"),
             ],
             CARD_ACTION: [
                 CallbackQueryHandler(
@@ -2086,9 +2260,11 @@ def main():
             ],
             CARD_UPDATE_BALANCE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_card_update_balance),
+                CallbackQueryHandler(cb_card_action, pattern="^card_back_list$"),
             ],
             WALLET_EDIT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_wallet_edit),
+                CallbackQueryHandler(cb_card_action, pattern="^card_back_list$"),
             ],
             CARD_DELETE_CONFIRM: [
                 CallbackQueryHandler(
@@ -2096,7 +2272,7 @@ def main():
                     pattern="^(card_del_confirm_|card_back_list$)",
                 ),
             ],
-            # Transfer states (faqat BIRGALIKDA uchun)
+            # Transfer states
             TRANSFER_FROM: [
                 CallbackQueryHandler(
                     cb_transfer_from,
@@ -2111,6 +2287,7 @@ def main():
             ],
             TRANSFER_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_transfer_amount),
+                CallbackQueryHandler(cb_transfer_amount_back, pattern="^trf_back_to_select$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
@@ -2132,10 +2309,7 @@ def main():
     app.add_handler(
         MessageHandler(~filters.User(list(ALLOWED_USER_IDS)), _unauthorized)
     )
-    app.add_handler(
-        CallbackQueryHandler(_unauthorized,
-                             pattern=None if True else "")  # hamma callbacklar
-    )
+    app.add_handler(CallbackQueryHandler(_unauthorized))  # hamma callbacklar
 
     # ─── Rejalashtirilgan kanal xabarlari ───────────────────────────────────
     jq = app.job_queue

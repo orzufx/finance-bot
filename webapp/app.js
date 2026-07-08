@@ -70,8 +70,9 @@ function switchTab(tabId) {
     const btn = document.querySelector(`.nav-btn[data-target="${tabId}"]`);
     if(btn) btn.classList.add('active');
 
-    if (tabId === 'tab-stats' && !myChart1) {
-        loadStats('week');
+    if (tabId === 'tab-stats') {
+        const activeBtn = document.querySelector('.period-btn.active');
+        loadStats(activeBtn ? activeBtn.dataset.period : 'week');
     }
 }
 
@@ -117,22 +118,47 @@ async function loadDashboard() {
         });
 
         if (cards.length === 0) {
-            cardsList.innerHTML = '<p style="color:var(--hint-color);text-align:center;padding:20px;">Kartalar yo\'q</p>';
+            const noCards = document.createElement('p');
+            noCards.style.cssText = 'color:var(--hint-color);text-align:center;padding:20px;';
+            noCards.textContent = "Kartalar yo'q";
+            cardsList.innerHTML = '';
+            cardsList.appendChild(noCards);
         } else {
             cardsList.innerHTML = '';
             cards.forEach(c => {
                 // Dashboard card
-                cardsList.innerHTML += `
-                    <div class="card-item">
-                        <div class="card-info">
-                            <span class="name">🏦 ${c.name}</span>
-                            ${c.number ? `<span class="num">**** ${c.number}</span>` : ''}
-                        </div>
-                        <span class="card-balance">${formatAmount(c.balance)}</span>
-                    </div>
-                `;
+                const cardDiv = document.createElement('div');
+                cardDiv.className = 'card-item';
+
+                const infoDiv = document.createElement('div');
+                infoDiv.className = 'card-info';
+
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'name';
+                nameSpan.textContent = '🏦 ' + c.name;
+                infoDiv.appendChild(nameSpan);
+
+                if (c.number) {
+                    const numSpan = document.createElement('span');
+                    numSpan.className = 'num';
+                    numSpan.textContent = '**** ' + c.number;
+                    infoDiv.appendChild(numSpan);
+                }
+
+                cardDiv.appendChild(infoDiv);
+
+                const balSpan = document.createElement('span');
+                balSpan.className = 'card-balance';
+                balSpan.textContent = formatAmount(c.balance);
+                cardDiv.appendChild(balSpan);
+
+                cardsList.appendChild(cardDiv);
+
                 // Add to payment select
-                paySelect.innerHTML += `<option value="card_${c.id}">💳 ${c.name}</option>`;
+                const opt = document.createElement('option');
+                opt.value = 'card_' + c.id;
+                opt.textContent = '💳 ' + c.name;
+                paySelect.appendChild(opt);
             });
         }
         
@@ -156,6 +182,10 @@ async function loadDashboard() {
 async function loadStats(period) {
     try {
         const res = await fetch(`${API_URL}/stats?period=${period}`, { headers: HEADERS });
+        if(!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            throw new Error(errData.error || 'Stats yuklashda xatolik');
+        }
         const data = await res.json();
         
         // Bar Chart (Income vs Expense)
@@ -244,7 +274,7 @@ async function handleAddTransaction(e) {
         
         if(!res.ok) throw new Error('Failed to save');
         
-        tg.HapticFeedback.notificationOccurred('success');
+        try { tg.HapticFeedback.notificationOccurred('success'); } catch(e) {}
         
         // Reset and reload
         document.getElementById('amount').value = '';
@@ -255,7 +285,7 @@ async function handleAddTransaction(e) {
         switchTab('tab-dashboard');
         
     } catch (err) {
-        tg.HapticFeedback.notificationOccurred('error');
+        try { tg.HapticFeedback.notificationOccurred('error'); } catch(e) {}
         tg.showAlert("Xatolik: " + err.message);
     } finally {
         btn.disabled = false;
