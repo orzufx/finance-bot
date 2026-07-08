@@ -258,7 +258,7 @@ body {
 .nav-btn span { font-size: 11px; font-weight: 500; }
 .nav-btn.active { color: var(--btn-color); }
 
-.nav-btn.add-btn { position: relative; top: -15px; flex: 0 0 auto; margin: 0 10px; }
+.nav-btn.add-btn { position: relative; top: -15px; flex: 0 0 auto; margin: 0 4px; }
 .fab {
     width: 56px; height: 56px;
     background: var(--btn-color); border-radius: 50%;
@@ -266,3 +266,31 @@ body {
     color: #fff; box-shadow: 0 4px 15px rgba(51, 144, 236, 0.4);
 }
 .fab svg { width: 28px; height: 28px; }
+
+/* History & Family */
+.month-nav { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+.month-btn {
+    width: 36px; height: 36px; border: none; border-radius: 10px;
+    background: var(--secondary-bg); color: var(--text-color);
+    font-size: 20px; cursor: pointer; border: 1px solid var(--card-border);
+}
+.month-btn:active { opacity: 0.7; }
+#hist-month-label { font-weight: 600; min-width: 84px; text-align: center; }
+
+.search-input {
+    width: 100%; padding: 12px 16px; margin-top: 12px;
+    background: var(--secondary-bg);
+    border: 1px solid var(--card-border); border-radius: 12px;
+    color: var(--text-color); font-family: var(--font-family); font-size: 14px;
+}
+.search-input:focus { outline: none; border-color: var(--btn-color); }
+
+.hist-sub { color: var(--hint-color); font-size: 12px; display: block; }
+.hist-amount { font-weight: 600; white-space: nowrap; }
+.hist-amount.income { color: var(--income-color); }
+.hist-amount.expense { color: var(--expense-color); }
+.del-btn {
+    background: none; border: none; font-size: 16px;
+    cursor: pointer; opacity: 0.7; padding: 4px;
+}
+.del-btn:active { opacity: 1; }

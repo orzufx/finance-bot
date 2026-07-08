@@ -1,5 +1,8 @@
 import calendar
+import csv
+import io
 import logging
+import re
 import sqlite3
 import traceback
 from datetime import datetime, timedelta, time as dt_time, timezone
@@ -673,6 +676,62 @@ def get_all_cards_summary() -> dict:
     return result
 
 
+def get_month_totals(ym: str) -> dict:
+    """{user: {'kirim': x, 'harajat': y}} — YYYY-MM oyi bo'yicha."""
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT user_name, type, SUM(amount) FROM transactions "
+        "WHERE created_at LIKE ? GROUP BY user_name, type",
+        (f"{ym}%",),
+    ).fetchall()
+    conn.close()
+    result: dict = {}
+    for user, ttype, total in rows:
+        result.setdefault(user, {"kirim": 0, "harajat": 0})[ttype] = total or 0
+    return result
+
+
+def get_month_categories(ym: str) -> list:
+    """[(category, total)] — harajatlar, kamayish tartibida."""
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT category, SUM(amount) FROM transactions "
+        "WHERE type='harajat' AND created_at LIKE ? "
+        "GROUP BY category ORDER BY SUM(amount) DESC",
+        (f"{ym}%",),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_month_top_expenses(ym: str, limit: int = 5) -> list:
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT user_name, category, amount, comment FROM transactions "
+        "WHERE type='harajat' AND created_at LIKE ? "
+        "ORDER BY amount DESC LIMIT ?",
+        (f"{ym}%", limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_transactions_for_month(user_name: str, ym: str) -> list:
+    """CSV eksport uchun: bitta user, YYYY-MM oyi."""
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT created_at, type, payment_method, category, amount, comment "
+        "FROM transactions WHERE user_name=? AND created_at LIKE ? ORDER BY created_at",
+        (user_name, f"{ym}%"),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def get_today_transactions_all(target_date: str = None) -> dict:
     """Returns {user_name: [(type, payment, category, amount, comment), ...]}."""
     conn = get_conn()
@@ -784,6 +843,67 @@ def build_channel_text(is_evening: bool = False, target_date: str = None) -> str
         f"🔴 *Umumiy harajat:* `{format_amount(grand_expense)}`\n"
         f"{bal_emoji} *Balans:*          `{sign}{format_amount(balance)}`"
     )
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n_...va boshqalar_"
+    return text
+
+
+UZ_MONTHS = ["Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun",
+             "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr"]
+
+
+def build_monthly_report_text(ym: str, prev_ym: str) -> str:
+    """Oy yakuni hisoboti: user kesimi, kategoriya (o'tgan oyga nisbatan), TOP-5."""
+    y, m = ym.split("-")
+    title = f"{UZ_MONTHS[int(m) - 1]} {y}"
+    lines = [f"📊 *{title} — Oylik hisobot*\n"]
+
+    totals = get_month_totals(ym)
+    if not totals:
+        lines.append("_Bu oyda hech qanday yozuv yo'q_")
+        return "\n".join(lines)
+
+    grand_inc = grand_exp = 0
+    for user in get_all_user_names():
+        d = totals.get(user)
+        if not d:
+            continue
+        inc, exp = d.get("kirim", 0), d.get("harajat", 0)
+        grand_inc += inc
+        grand_exp += exp
+        lines.append(f"👤 *{user}*")
+        lines.append(f"  ├ 💚 Kirim:    `{format_amount(inc)}`")
+        lines.append(f"  └ 🔴 Harajat: `{format_amount(exp)}`")
+    balance = grand_inc - grand_exp
+    sign    = "+" if balance >= 0 else ""
+    lines.append("")
+    lines.append(f"💚 *Jami kirim:*    `{format_amount(grand_inc)}`")
+    lines.append(f"🔴 *Jami harajat:* `{format_amount(grand_exp)}`")
+    lines.append(f"{'💚' if balance >= 0 else '🔴'} *Balans:* `{sign}{format_amount(balance)}`")
+    lines.append("━" * 22)
+
+    cats = get_month_categories(ym)
+    if cats:
+        prev = dict(get_month_categories(prev_ym))
+        lines.append("📂 *Kategoriyalar (o'tgan oyga nisbatan):*\n")
+        for cat, total in cats:
+            p = prev.get(cat)
+            if p:
+                pct = (total - p) / p * 100
+                cmp = f"📈 +{pct:.0f}%" if pct > 0.5 else (f"📉 {pct:.0f}%" if pct < -0.5 else "→ 0%")
+            else:
+                cmp = "🆕"
+            lines.append(f"{cat}  `{format_amount(total)}`  _{cmp}_")
+        lines.append("")
+
+    top = get_month_top_expenses(ym)
+    if top:
+        lines.append("🏆 *TOP-5 eng katta harajat:*\n")
+        for i, (user, cat, amount, cmt) in enumerate(top, 1):
+            cmt_str = f" · _{cmt}_" if cmt else ""
+            lines.append(f"*{i}.* `{format_amount(amount)}` — {cat} ({user}){cmt_str}")
+
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:3900] + "\n\n_...va boshqalar_"
@@ -913,6 +1033,25 @@ async def send_recurring_reminders(context):
             logger.warning(f"[RECURRING] {user_name} ({tg_id}) ga yuborilmadi: {e}")
 
 
+async def send_monthly_report(context):
+    """Har oyning 1-kuni 00:15 (Toshkent) — o'tgan oy hisobotini kanalga yuboradi.
+    run_daily bilan chaqiriladi, kun tekshiruvi shu yerda."""
+    now = datetime.now(UTC5)
+    if now.day != 1:
+        return
+    last_month_end = now.replace(day=1) - timedelta(days=1)
+    ym      = last_month_end.strftime("%Y-%m")
+    prev_ym = (last_month_end.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    try:
+        text = build_monthly_report_text(ym, prev_ym)
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID, text=text, parse_mode="Markdown"
+        )
+        logger.info(f"[CHANNEL] Monthly report sent for {ym}")
+    except Exception as e:
+        logger.error(f"[CHANNEL] Monthly report failed: {e}")
+
+
 # ─── Texts ───────────────────────────────────────────────────────────────────
 TEXTS = {
     "uz": {
@@ -979,6 +1118,7 @@ TEXTS = {
         "rec_not_found":        "Eslatma topilmadi",
         "rec_paid":             "yozildi, balansdan ayirildi",
         "rec_skipped":          "bu oy o'tkazib yuborildi",
+        "quick_hint":           "✍️ *Tez kiritish*\n\n`50000 taksi` → 💸 harajat\n`+500000 maosh` → 💰 kirim\n\n_Summa va izoh yozing — qolganini tugmalar bilan tanlaysiz. Yoki menyudan foydalaning_ 👇",
     },
     "en": {
         "welcome":              "🏦 *Finance Bot*\n\nHello!\nPlease choose a language:",
@@ -1044,6 +1184,7 @@ TEXTS = {
         "rec_not_found":        "Reminder not found",
         "rec_paid":             "recorded, balance updated",
         "rec_skipped":          "skipped this month",
+        "quick_hint":           "✍️ *Quick entry*\n\n`50000 taxi` → 💸 expense\n`+500000 salary` → 💰 income\n\n_Type amount and comment — pick the rest with buttons. Or use the menu_ 👇",
     },
 }
 
@@ -1093,6 +1234,25 @@ def parse_date(date_str: str):
         return datetime.strptime(date_str.strip(), "%d.%m.%Y")
     except ValueError:
         return None
+
+
+_QUICK_RE = re.compile(r"^(\+?)\s*(\d[\d\s.,]*)\s*(.*)$", re.S)
+
+def parse_quick_entry(text: str):
+    """Tez kiritish: '50000 taksi' -> ('harajat', 50000.0, 'taksi'),
+    '+500000 maosh' -> ('kirim', 500000.0, 'maosh'). Mos kelmasa None."""
+    m = _QUICK_RE.match(text.strip())
+    if not m:
+        return None
+    sign, num, comment = m.groups()
+    try:
+        amount = float(num.replace(" ", "").replace(",", ""))
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    trans_type = "kirim" if sign == "+" else "harajat"
+    return trans_type, amount, comment.strip()
 
 
 def build_summary_text(user_name: str, period: str, period_label: str, ctx) -> str:
@@ -1288,17 +1448,63 @@ def kb_payment_methods(ctx, prefix: str):
     ])
 
 
-def kb_all_cards_for_transfer(ctx, exclude_card_id=None):
-    """Faqat joriy foydalanuvchi kartalarini ko'rsatadi (o'tkazma uchun)."""
+def parse_transfer_ref(data: str):
+    """'trf_card_5' -> ('card', 5); 'trf_wallet_avo' -> ('wallet', 'avo')."""
+    if data.startswith("trf_card_"):
+        return ("card", int(data.split("trf_card_")[1]))
+    if data.startswith("trf_wallet_"):
+        return ("wallet", data.split("trf_wallet_")[1])
+    return None
+
+
+def transfer_ref_info(ref, user_name: str, ctx):
+    """(label, balans) qaytaradi; karta o'chirilgan bo'lsa None."""
+    kind, val = ref
+    if kind == "card":
+        card = get_card_by_id(val)
+        if not card:
+            return None
+        return (f"🏦 {card[1]}", card[3])
+    if val == "avo":
+        return ("🏛 AVO", get_wallet_balance(AVO_USER, "avo"))
+    label = "💵 Naqd" if lang(ctx) == "uz" else "💵 Cash"
+    return (label, get_wallet_balance(user_name, "naqd"))
+
+
+def apply_transfer_delta(ref, user_name: str, delta: float):
+    kind, val = ref
+    if kind == "card":
+        adjust_card_balance(val, delta)
+    else:
+        # Upsert — hamyon qatori hali yaratilmagan bo'lishi mumkin
+        w_user = AVO_USER if val == "avo" else user_name
+        set_wallet_balance(w_user, val, get_wallet_balance(w_user, val) + delta)
+
+
+def kb_transfer_targets(ctx, exclude_ref=None):
+    """O'tkazma manbalari: AVO, Naqd va kartalar."""
     user_name = ctx.user_data.get("user_name", "")
+    l = lang(ctx)
     buttons = []
-    cards = get_cards(user_name)
-    for card_id, name, number, balance in cards:
-        if card_id == exclude_card_id:
+    if exclude_ref != ("wallet", "avo"):
+        avo_bal = get_wallet_balance(AVO_USER, "avo")
+        buttons.append([InlineKeyboardButton(
+            f"🏛 AVO — {format_amount(avo_bal)}", callback_data="trf_wallet_avo"
+        )])
+    if exclude_ref != ("wallet", "naqd"):
+        naqd_lbl = "💵 Naqd" if l == "uz" else "💵 Cash"
+        naqd_bal = get_wallet_balance(user_name, "naqd")
+        buttons.append([InlineKeyboardButton(
+            f"{naqd_lbl} — {format_amount(naqd_bal)}", callback_data="trf_wallet_naqd"
+        )])
+    for card_id, name, number, balance in get_cards(user_name):
+        if exclude_ref == ("card", card_id):
             continue
         num_str = f" ({mask_number(number)})" if number else ""
-        label   = f"🏦 {name}{num_str} — {format_amount(balance)}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"trf_card_{card_id}")])
+        buttons.append([InlineKeyboardButton(
+            f"🏦 {name}{num_str} — {format_amount(balance)}",
+            callback_data=f"trf_card_{card_id}",
+        )])
     buttons.append([InlineKeyboardButton(t("back", ctx), callback_data="menu_back_main")])
     return InlineKeyboardMarkup(buttons)
 
@@ -1501,6 +1707,10 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
+    # Chala qolgan tez-kiritish oqimi keyingi oqimga aralashmasin
+    ctx.user_data.pop("quick_entry", None)
+    ctx.user_data.pop("quick_comment", None)
+
     if data == "menu_expense":
         ctx.user_data["trans_type"] = "harajat"
         ctx.user_data.pop("custom_date", None)
@@ -1526,13 +1736,13 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_transfer":
         l    = lang(ctx)
         text = (
-            "🔄 *O'tkazma*\n\n📤 _Qaysi kartadan_ o'tkazmoqchisiz?"
+            "🔄 *O'tkazma*\n\n📤 _Qayerdan_ o'tkazmoqchisiz?"
             if l == "uz" else
-            "🔄 *Transfer*\n\n📤 _Which card_ to transfer FROM?"
+            "🔄 *Transfer*\n\n📤 Transfer _from where_?"
         )
         await query.edit_message_text(
             text, parse_mode="Markdown",
-            reply_markup=kb_all_cards_for_transfer(ctx),
+            reply_markup=kb_transfer_targets(ctx),
         )
         return TRANSFER_FROM
 
@@ -1602,6 +1812,35 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
 
     return MAIN_MENU
+
+
+# ── Quick Entry ──
+async def msg_quick_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Bosh menyuda oddiy matn: '50000 taksi' → tez kiritish oqimi."""
+    parsed = parse_quick_entry(update.message.text)
+    if not parsed:
+        await update.message.reply_text(
+            t("quick_hint", ctx), parse_mode="Markdown", reply_markup=kb_main(ctx)
+        )
+        return MAIN_MENU
+
+    trans_type, amount, comment = parsed
+    ctx.user_data["trans_type"]    = trans_type
+    ctx.user_data["amount"]        = amount
+    ctx.user_data["quick_comment"] = comment
+    ctx.user_data["quick_entry"]   = True
+    ctx.user_data.pop("custom_date", None)
+    ctx.user_data.pop("custom_date_display", None)
+
+    type_emoji = "💰" if trans_type == "kirim" else "💸"
+    cmt_note   = f" · _{comment}_" if comment else ""
+    prefix     = "inc_pay_" if trans_type == "kirim" else "exp_pay_"
+    await update.message.reply_text(
+        f"{type_emoji} *{format_amount(amount)}*{cmt_note}\n\n{t('payment_method', ctx)}",
+        parse_mode="Markdown",
+        reply_markup=kb_payment_methods(ctx, prefix),
+    )
+    return INCOME_PAYMENT if trans_type == "kirim" else EXPENSE_PAYMENT
 
 
 # ── Another Date ──
@@ -1737,6 +1976,11 @@ async def cb_expense_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return SELECT_CARD_FOR_EXPENSE
 
+    # Tez kiritishda summa allaqachon bor → darhol saqlaymiz
+    if ctx.user_data.pop("quick_entry", False):
+        _save_and_deduct(ctx, ctx.user_data.pop("quick_comment", ""))
+        return await _finalize_save_from_callback(query, ctx)
+
     # No card needed → ask amount
     await query.edit_message_text(
         f"💳 *{payment}* › 📂 *{category}*{date_note}\n\n{t('enter_amount', ctx)}",
@@ -1818,6 +2062,10 @@ async def cb_income_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return SELECT_CARD_FOR_EXPENSE
 
+    if ctx.user_data.pop("quick_entry", False):
+        _save_and_deduct(ctx, ctx.user_data.pop("quick_comment", ""))
+        return await _finalize_save_from_callback(query, ctx)
+
     await query.edit_message_text(
         f"💰 *{payment}* › 📂 *{category}*{date_note}\n\n{t('enter_amount', ctx)}",
         parse_mode="Markdown",
@@ -1859,6 +2107,10 @@ async def cb_select_payment_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     payment  = ctx.user_data.get("payment_method", "")
     date_str = ctx.user_data.get("custom_date_display", "")
     date_note = f"\n📅 _{date_str}_" if date_str else ""
+
+    if ctx.user_data.pop("quick_entry", False):
+        _save_and_deduct(ctx, ctx.user_data.pop("quick_comment", ""))
+        return await _finalize_save_from_callback(query, ctx)
 
     await query.edit_message_text(
         f"💳 *{payment}* › 📂 *{category}*{date_note}\n"
@@ -1975,7 +2227,8 @@ def _save_and_deduct(ctx, comment):
     # _show_main_menu chaqirilgandan keyin o'chiriladi
 
 
-async def _show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+def _build_saved_text(ctx) -> str:
+    """Saqlangan tranzaksiya tasdiq matni (reply va edit uchun umumiy)."""
     user_name  = ctx.user_data.get("user_name", "?")
     amount     = ctx.user_data.get("amount", 0)
     trans_type = ctx.user_data.get("trans_type", "harajat")
@@ -1996,25 +2249,44 @@ async def _show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     type_emoji = "💸" if trans_type == "harajat" else "💰"
     menu_label = t("main_menu", ctx)
-    text = (
+    return (
         f"✅ *{format_amount(amount)}* {saved_msg}!\n"
         f"┌─ {type_emoji} {payment}"
         f"\n└─ 📂 {category}{card_note}"
         f"\n\n👤 *{user_name}* · 📋 {menu_label}"
     )
+
+
+async def _update_channel_after_save(bot, ctx):
+    """Saqlashdan keyin kanal xabarini yangilaydi (custom_date ni tozalab)."""
+    saved_custom_date = ctx.user_data.pop("custom_date", None)
+    ctx.user_data.pop("custom_date_display", None)
+    try:
+        await update_channel_message(bot, target_date=saved_custom_date)
+    except Exception as e:
+        logger.warning(f"[CHANNEL] Update skipped: {e}")
+
+
+async def _show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = _build_saved_text(ctx)
     last_txn_id = ctx.user_data.pop("_last_txn_id", None)
     await update.message.reply_text(
         text, parse_mode="Markdown",
         reply_markup=kb_main(ctx, undo_txn_id=last_txn_id),
     )
-    # Kanal xabarini yangilash (fon, xato bo'lsa ham davom etadi)
-    # custom_date hali ctx.user_data da bor (endi o'chiramiz)
-    saved_custom_date = ctx.user_data.pop("custom_date", None)
-    ctx.user_data.pop("custom_date_display", None)
-    try:
-        await update_channel_message(ctx.bot, target_date=saved_custom_date)
-    except Exception as e:
-        logger.warning(f"[CHANNEL] Update skipped: {e}")
+    await _update_channel_after_save(ctx.bot, ctx)
+    return MAIN_MENU
+
+
+async def _finalize_save_from_callback(query, ctx):
+    """Tez kiritish oqimida callbackdan saqlashni yakunlaydi."""
+    text = _build_saved_text(ctx)
+    last_txn_id = ctx.user_data.pop("_last_txn_id", None)
+    await query.edit_message_text(
+        text, parse_mode="Markdown",
+        reply_markup=kb_main(ctx, undo_txn_id=last_txn_id),
+    )
+    await _update_channel_after_save(ctx.bot, ctx)
     return MAIN_MENU
 
 
@@ -2054,6 +2326,48 @@ async def cb_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/export [YYYY-MM] — oy tranzaksiyalarini CSV qilib yuboradi."""
+    user_name = get_user_name(update.effective_user.id)
+    if not user_name:
+        await update.message.reply_text("Avval /start bosib ro'yxatdan o'ting.")
+        return
+
+    args = ctx.args or []
+    if args and re.fullmatch(r"\d{4}-\d{2}", args[0]):
+        ym = args[0]
+    else:
+        ym = datetime.now(UTC5).strftime("%Y-%m")
+
+    rows = get_transactions_for_month(user_name, ym)
+    if not rows:
+        await update.message.reply_text(f"📭 {ym} uchun yozuv topilmadi")
+        return
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Sana", "Turi", "To'lov usuli", "Kategoriya", "Summa", "Izoh"])
+    total_exp = total_inc = 0
+    for created_at, ttype, pm, cat, amount, cmt in rows:
+        w.writerow([created_at[:16].replace("T", " "), ttype, pm, cat, amount, cmt or ""])
+        if ttype == "harajat":
+            total_exp += amount
+        else:
+            total_inc += amount
+
+    # utf-8-sig — Excel kirillcha/emoji ni to'g'ri ochishi uchun
+    data = buf.getvalue().encode("utf-8-sig")
+    await update.message.reply_document(
+        document=data,
+        filename=f"finance_{user_name}_{ym}.csv",
+        caption=(
+            f"📄 *{user_name} — {ym}*\n"
+            f"{len(rows)} ta yozuv · 💚 `{format_amount(total_inc)}` · 🔴 `{format_amount(total_exp)}`"
+        ),
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     current_lang = ctx.user_data.get("lang", "uz")
     ctx.user_data.clear()
@@ -2065,13 +2379,13 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Transfer Handlers ──
 async def cb_transfer_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Qaysi kartadan — FROM kartani tanlash."""
+    """Qayerdan — FROM manbani tanlash (AVO/Naqd/karta)."""
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data      = query.data
+    user_name = ctx.user_data.get("user_name", "?")
 
     if data == "menu_back_main":
-        user_name = ctx.user_data.get("user_name", "?")
         await query.edit_message_text(
             f"👫 *{user_name}* — {t('main_menu', ctx)}",
             parse_mode="Markdown",
@@ -2079,62 +2393,81 @@ async def cb_transfer_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return MAIN_MENU
 
-    from_card_id = int(data.split("trf_card_")[1])
-    from_card    = get_card_by_id(from_card_id)
-    ctx.user_data["trf_from_id"] = from_card_id
+    ref  = parse_transfer_ref(data)
+    info = transfer_ref_info(ref, user_name, ctx) if ref else None
+    if info is None:
+        await query.edit_message_text(
+            "🔄 *O'tkazma*\n\n📤 _Qayerdan_ o'tkazmoqchisiz?"
+            if lang(ctx) == "uz" else
+            "🔄 *Transfer*\n\n📤 Transfer _from where_?",
+            parse_mode="Markdown",
+            reply_markup=kb_transfer_targets(ctx),
+        )
+        return TRANSFER_FROM
+
+    ctx.user_data["trf_from_ref"] = ref
+    label, bal = info
     l = lang(ctx)
     text = (
         f"🔄 *O'tkazma*\n"
-        f"📤 _Dan:_ 🏦 *{from_card[1]}*  `{format_amount(from_card[3])}`\n\n"
-        f"📥 _Qaysi kartaga_ o'tkazmoqchisiz?"
+        f"📤 _Dan:_ *{label}*  `{format_amount(bal)}`\n\n"
+        f"📥 _Qayerga_ o'tkazmoqchisiz?"
         if l == "uz" else
         f"🔄 *Transfer*\n"
-        f"📤 _From:_ 🏦 *{from_card[1]}*  `{format_amount(from_card[3])}`\n\n"
-        f"📥 _Which card_ to transfer TO?"
+        f"📤 _From:_ *{label}*  `{format_amount(bal)}`\n\n"
+        f"📥 Transfer _to where_?"
     )
     await query.edit_message_text(
         text, parse_mode="Markdown",
-        reply_markup=kb_all_cards_for_transfer(ctx, exclude_card_id=from_card_id),
+        reply_markup=kb_transfer_targets(ctx, exclude_ref=ref),
     )
     return TRANSFER_TO
 
 
 async def cb_transfer_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Qaysi kartaga — TO kartani tanlash."""
+    """Qayerga — TO manbani tanlash."""
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data      = query.data
+    user_name = ctx.user_data.get("user_name", "?")
 
     if data == "menu_back_main":
         # FROM ga qaytish
-        l    = lang(ctx)
-        text = (
-            "🔄 *O'tkazma*\n\n📤 _Qaysi kartadan_ o'tkazmoqchisiz?"
-            if l == "uz" else
-            "🔄 *Transfer*\n\n📤 _Which card_ to transfer FROM?"
-        )
         await query.edit_message_text(
-            text, parse_mode="Markdown",
-            reply_markup=kb_all_cards_for_transfer(ctx),
+            "🔄 *O'tkazma*\n\n📤 _Qayerdan_ o'tkazmoqchisiz?"
+            if lang(ctx) == "uz" else
+            "🔄 *Transfer*\n\n📤 Transfer _from where_?",
+            parse_mode="Markdown",
+            reply_markup=kb_transfer_targets(ctx),
         )
         return TRANSFER_FROM
 
-    to_card_id = int(data.split("trf_card_")[1])
-    to_card    = get_card_by_id(to_card_id)
-    ctx.user_data["trf_to_id"] = to_card_id
+    to_ref    = parse_transfer_ref(data)
+    from_ref  = ctx.user_data.get("trf_from_ref")
+    to_info   = transfer_ref_info(to_ref, user_name, ctx) if to_ref else None
+    from_info = transfer_ref_info(from_ref, user_name, ctx) if from_ref else None
+    if to_info is None or from_info is None:
+        await query.edit_message_text(
+            "🔄 *O'tkazma*\n\n📤 _Qayerdan_ o'tkazmoqchisiz?"
+            if lang(ctx) == "uz" else
+            "🔄 *Transfer*\n\n📤 Transfer _from where_?",
+            parse_mode="Markdown",
+            reply_markup=kb_transfer_targets(ctx),
+        )
+        return TRANSFER_FROM
 
-    from_card_id = ctx.user_data.get("trf_from_id")
-    from_card    = get_card_by_id(from_card_id)
+    ctx.user_data["trf_to_ref"] = to_ref
+    (f_label, f_bal), (t_label, t_bal) = from_info, to_info
     l = lang(ctx)
     text = (
         f"🔄 *O'tkazma*\n"
-        f"📤 _Dan:_ 🏦 *{from_card[1]}*  `{format_amount(from_card[3])}`\n"
-        f"📥 _Ga:_  🏦 *{to_card[1]}*   `{format_amount(to_card[3])}`\n\n"
+        f"📤 _Dan:_ *{f_label}*  `{format_amount(f_bal)}`\n"
+        f"📥 _Ga:_  *{t_label}*  `{format_amount(t_bal)}`\n\n"
         f"💵 *Miqdorni kiriting* (so'm):"
         if l == "uz" else
         f"🔄 *Transfer*\n"
-        f"📤 _From:_ 🏦 *{from_card[1]}*  `{format_amount(from_card[3])}`\n"
-        f"📥 _To:_   🏦 *{to_card[1]}*   `{format_amount(to_card[3])}`\n\n"
+        f"📤 _From:_ *{f_label}*  `{format_amount(f_bal)}`\n"
+        f"📥 _To:_   *{t_label}*  `{format_amount(t_bal)}`\n\n"
         f"💵 *Enter amount* (UZS):"
     )
     await query.edit_message_text(
@@ -2145,14 +2478,14 @@ async def cb_transfer_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cb_transfer_amount_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """TRANSFER_AMOUNT dan TO-karta tanlashga qaytish."""
+    """TRANSFER_AMOUNT dan TO tanlashga qaytish."""
     query = update.callback_query
     await query.answer()
-    from_card_id = ctx.user_data.get("trf_from_id")
-    from_card    = get_card_by_id(from_card_id) if from_card_id else None
+    user_name = ctx.user_data.get("user_name", "?")
+    from_ref  = ctx.user_data.get("trf_from_ref")
+    from_info = transfer_ref_info(from_ref, user_name, ctx) if from_ref else None
 
-    if not from_card:
-        user_name = ctx.user_data.get("user_name", "?")
+    if from_info is None:
         await query.edit_message_text(
             f"👤 *{user_name}* — {t('main_menu', ctx)}",
             parse_mode="Markdown",
@@ -2160,19 +2493,20 @@ async def cb_transfer_amount_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         )
         return MAIN_MENU
 
+    label, bal = from_info
     l = lang(ctx)
     text = (
         f"🔄 *O'tkazma*\n"
-        f"📤 _Dan:_ 🏦 *{from_card[1]}*  `{format_amount(from_card[3])}`\n\n"
-        f"📥 _Qaysi kartaga_ o'tkazmoqchisiz?"
+        f"📤 _Dan:_ *{label}*  `{format_amount(bal)}`\n\n"
+        f"📥 _Qayerga_ o'tkazmoqchisiz?"
         if l == "uz" else
         f"🔄 *Transfer*\n"
-        f"📤 _From:_ 🏦 *{from_card[1]}*  `{format_amount(from_card[3])}`\n\n"
-        f"📥 _Which card_ to transfer TO?"
+        f"📤 _From:_ *{label}*  `{format_amount(bal)}`\n\n"
+        f"📥 Transfer _to where_?"
     )
     await query.edit_message_text(
         text, parse_mode="Markdown",
-        reply_markup=kb_all_cards_for_transfer(ctx, exclude_card_id=from_card_id),
+        reply_markup=kb_transfer_targets(ctx, exclude_ref=from_ref),
     )
     return TRANSFER_TO
 
@@ -2189,30 +2523,32 @@ async def msg_transfer_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return TRANSFER_AMOUNT
 
-    from_id   = ctx.user_data.pop("trf_from_id", None)
-    to_id     = ctx.user_data.pop("trf_to_id",   None)
-    from_card = get_card_by_id(from_id)
-    to_card   = get_card_by_id(to_id)
+    user_name = ctx.user_data.get("user_name", "?")
+    from_ref  = ctx.user_data.pop("trf_from_ref", None)
+    to_ref    = ctx.user_data.pop("trf_to_ref",   None)
+    from_info = transfer_ref_info(from_ref, user_name, ctx) if from_ref else None
+    to_info   = transfer_ref_info(to_ref, user_name, ctx) if to_ref else None
 
-    if from_card and to_card:
-        new_from = from_card[3] - amount
-        new_to   = to_card[3]  + amount
-        update_card_balance(from_id, new_from)
-        update_card_balance(to_id,   new_to)
+    if from_info and to_info:
+        apply_transfer_delta(from_ref, user_name, -amount)
+        apply_transfer_delta(to_ref,   user_name,  amount)
+        (f_label, f_bal), (t_label, t_bal) = from_info, to_info
+        new_from = f_bal - amount
+        new_to   = t_bal + amount
         l = lang(ctx)
         msg = (
             f"✅ *O'tkazma amalga oshdi!*\n\n"
-            f"📤 🏦 *{from_card[1]}*\n"
-            f"   `{format_amount(from_card[3])}` ➜ `{format_amount(new_from)}`\n\n"
-            f"📥 🏦 *{to_card[1]}*\n"
-            f"   `{format_amount(to_card[3])}` ➜ `{format_amount(new_to)}`\n\n"
+            f"📤 *{f_label}*\n"
+            f"   `{format_amount(f_bal)}` ➜ `{format_amount(new_from)}`\n\n"
+            f"📥 *{t_label}*\n"
+            f"   `{format_amount(t_bal)}` ➜ `{format_amount(new_to)}`\n\n"
             f"💸 *Miqdor: `{format_amount(amount)}`*"
             if l == "uz" else
             f"✅ *Transfer completed!*\n\n"
-            f"📤 🏦 *{from_card[1]}*\n"
-            f"   `{format_amount(from_card[3])}` ➜ `{format_amount(new_from)}`\n\n"
-            f"📥 🏦 *{to_card[1]}*\n"
-            f"   `{format_amount(to_card[3])}` ➜ `{format_amount(new_to)}`\n\n"
+            f"📤 *{f_label}*\n"
+            f"   `{format_amount(f_bal)}` ➜ `{format_amount(new_from)}`\n\n"
+            f"📥 *{t_label}*\n"
+            f"   `{format_amount(t_bal)}` ➜ `{format_amount(new_to)}`\n\n"
             f"💸 *Amount: `{format_amount(amount)}`*"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
@@ -2222,7 +2558,6 @@ async def msg_transfer_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"[CHANNEL] Update skipped: {e}")
 
-    user_name = ctx.user_data.get("user_name", "?")
     await update.message.reply_text(
         f"👫 *{user_name}* — {t('main_menu', ctx)}",
         parse_mode="Markdown",
@@ -2788,6 +3123,7 @@ def main():
                     pattern="^(menu_|report_|change_)",
                 ),
                 CallbackQueryHandler(cb_undo, pattern=r"^undo_\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_quick_entry),
             ],
             ANOTHER_DATE_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_another_date_input),
@@ -2879,13 +3215,13 @@ def main():
             TRANSFER_FROM: [
                 CallbackQueryHandler(
                     cb_transfer_from,
-                    pattern="^(trf_card_|menu_back_main$)",
+                    pattern="^(trf_card_|trf_wallet_|menu_back_main$)",
                 ),
             ],
             TRANSFER_TO: [
                 CallbackQueryHandler(
                     cb_transfer_to,
-                    pattern="^(trf_card_|menu_back_main$)",
+                    pattern="^(trf_card_|trf_wallet_|menu_back_main$)",
                 ),
             ],
             TRANSFER_AMOUNT: [
@@ -2931,6 +3267,9 @@ def main():
     # Eslatma tugmalari suhbatdan tashqarida ham ishlashi kerak
     # (eslatma xabari istalgan paytda keladi, hatto bot restartidan keyin ham)
     app.add_handler(CallbackQueryHandler(cb_recurring_action, pattern=r"^rec_(pay|skip)_\d+$"))
+    # /export ham istalgan holatda ishlaydi
+    app.add_handler(CommandHandler("export", cmd_export,
+                                   filters=filters.User(list(ALLOWED_USER_IDS))))
 
     # Ruxsatsiz foydalanuvchilar uchun yopuvchi handler
     async def _unauthorized(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2964,6 +3303,12 @@ def main():
         send_recurring_reminders,
         time=dt_time(hour=4, minute=0, second=0, tzinfo=timezone.utc),
         name="recurring_reminders",
+    )
+    # 00:15 Toshkent = 19:15 UTC — oy boshida o'tgan oy hisoboti (kun tekshiruvi ichkarida)
+    jq.run_daily(
+        send_monthly_report,
+        time=dt_time(hour=19, minute=15, second=0, tzinfo=timezone.utc),
+        name="monthly_report",
     )
     logger.info("Finance Bot ishga tushdi ✅ | Kanal xabarlari rejalashtirildi")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

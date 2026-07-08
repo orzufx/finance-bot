@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import hmac
 import hashlib
@@ -356,6 +357,155 @@ def add_transaction(user_name):
         return jsonify({"error": "Server xatosi"}), 500
     finally:
         conn.close()
+
+@app.route('/api/history', methods=['GET'])
+@require_auth
+def history(user_name):
+    month = request.args.get('month', '')
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        month = datetime.now(UTC5).strftime("%Y-%m")
+    category = (request.args.get('category') or '').strip()
+    q = (request.args.get('q') or '').strip().lower()
+
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        if category:
+            sql = ("SELECT id, type, payment_method, category, amount, comment, created_at "
+                   "FROM transactions WHERE user_name=%s AND created_at LIKE %s AND category=%s "
+                   "ORDER BY created_at DESC LIMIT 500") if DATABASE_URL else \
+                  ("SELECT id, type, payment_method, category, amount, comment, created_at "
+                   "FROM transactions WHERE user_name=? AND created_at LIKE ? AND category=? "
+                   "ORDER BY created_at DESC LIMIT 500")
+            c.execute(sql, (user_name, f"{month}%", category))
+        else:
+            sql = ("SELECT id, type, payment_method, category, amount, comment, created_at "
+                   "FROM transactions WHERE user_name=%s AND created_at LIKE %s "
+                   "ORDER BY created_at DESC LIMIT 500") if DATABASE_URL else \
+                  ("SELECT id, type, payment_method, category, amount, comment, created_at "
+                   "FROM transactions WHERE user_name=? AND created_at LIKE ? "
+                   "ORDER BY created_at DESC LIMIT 500")
+            c.execute(sql, (user_name, f"{month}%"))
+
+        items = []
+        total_exp = total_inc = 0
+        for r in c.fetchall():
+            item = {"id": r[0], "type": r[1], "payment": r[2] or "",
+                    "category": r[3] or "", "amount": r[4],
+                    "comment": r[5] or "", "date": r[6]}
+            if q and q not in f"{item['category']} {item['comment']} {item['payment']}".lower():
+                continue
+            items.append(item)
+            if item["type"] == "harajat":
+                total_exp += item["amount"]
+            else:
+                total_inc += item["amount"]
+
+        return jsonify({"month": month, "items": items,
+                        "total_harajat": total_exp, "total_kirim": total_inc})
+    finally:
+        conn.close()
+
+
+@app.route('/api/transaction/<int:txn_id>', methods=['DELETE'])
+@require_auth
+def delete_transaction(user_name, txn_id):
+    """Tranzaksiyani o'chirib, karta/hamyon balansini qaytaradi."""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        q_sel = ("SELECT id, user_name, type, payment_method, amount, card_id "
+                 "FROM transactions WHERE id=%s") if DATABASE_URL else \
+                ("SELECT id, user_name, type, payment_method, amount, card_id "
+                 "FROM transactions WHERE id=?")
+        c.execute(q_sel, (txn_id,))
+        row = c.fetchone()
+        if not row or row[1] != user_name:
+            return jsonify({"error": "Yozuv topilmadi"}), 404
+
+        _, _, trans_type, payment_method, amount, card_id = row
+        delta = amount if trans_type == "kirim" else -amount  # saqlashdagi o'zgarish
+
+        if card_id:
+            q_card = ("UPDATE cards SET balance = balance - %s WHERE id=%s") if DATABASE_URL else \
+                     ("UPDATE cards SET balance = balance - ? WHERE id=?")
+            c.execute(q_card, (delta, card_id))
+        else:
+            pm = (payment_method or '').lower()
+            wtype = "avo" if "avo" in pm else ("naqd" if "naqd" in pm or "cash" in pm else None)
+            if wtype:
+                w_user = "SHARED" if wtype == "avo" else user_name
+                q_w = ("UPDATE wallets SET balance = balance - %s WHERE user_name=%s AND wallet_type=%s") if DATABASE_URL else \
+                      ("UPDATE wallets SET balance = balance - ? WHERE user_name=? AND wallet_type=?")
+                c.execute(q_w, (delta, w_user, wtype))
+
+        q_del = "DELETE FROM transactions WHERE id=%s" if DATABASE_URL else "DELETE FROM transactions WHERE id=?"
+        c.execute(q_del, (txn_id,))
+        conn.commit()
+        return jsonify({"success": True})
+    except Exception:
+        conn.rollback()
+        logging.exception("Transaction delete failed")
+        return jsonify({"error": "Server xatosi"}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/family', methods=['GET'])
+@require_auth
+def family(user_name):
+    """Oila umumiy ko'rinishi: barcha userlarning balanslari va oy natijasi."""
+    month = datetime.now(UTC5).strftime("%Y-%m")
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT display_name FROM users ORDER BY created_at")
+        users = [r[0] for r in c.fetchall()]
+
+        q_wallet = ("SELECT balance FROM wallets WHERE user_name=%s AND wallet_type=%s") if DATABASE_URL else \
+                   ("SELECT balance FROM wallets WHERE user_name=? AND wallet_type=?")
+        c.execute(q_wallet, ("SHARED", "avo"))
+        row = c.fetchone()
+        avo = row[0] if row else 0
+
+        c.execute("SELECT user_name, SUM(balance) FROM cards GROUP BY user_name")
+        cards_by_user = {r[0]: (r[1] or 0) for r in c.fetchall()}
+
+        q_month = ("SELECT user_name, type, SUM(amount) FROM transactions "
+                   "WHERE created_at LIKE %s GROUP BY user_name, type") if DATABASE_URL else \
+                  ("SELECT user_name, type, SUM(amount) FROM transactions "
+                   "WHERE created_at LIKE ? GROUP BY user_name, type")
+        c.execute(q_month, (f"{month}%",))
+        month_by_user = {}
+        for u, ttype, total in c.fetchall():
+            month_by_user.setdefault(u, {"kirim": 0, "harajat": 0})[ttype] = total or 0
+
+        result_users = []
+        grand_total = avo
+        fam_inc = fam_exp = 0
+        for u in users:
+            c.execute(q_wallet, (u, "naqd"))
+            row = c.fetchone()
+            naqd = row[0] if row else 0
+            cards_total = cards_by_user.get(u, 0)
+            m = month_by_user.get(u, {"kirim": 0, "harajat": 0})
+            grand_total += naqd + cards_total
+            fam_inc += m["kirim"]
+            fam_exp += m["harajat"]
+            result_users.append({
+                "name": u, "naqd": naqd, "cards_total": cards_total,
+                "total": naqd + cards_total,
+                "month_kirim": m["kirim"], "month_harajat": m["harajat"],
+            })
+
+        return jsonify({
+            "month": month, "avo": avo, "users": result_users,
+            "grand_total": grand_total,
+            "family_month_kirim": fam_inc, "family_month_harajat": fam_exp,
+        })
+    finally:
+        conn.close()
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

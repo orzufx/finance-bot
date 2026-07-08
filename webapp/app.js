@@ -17,6 +17,11 @@ let currentTab = 'tab-dashboard';
 let cards = [];
 let myChart1 = null;
 let myChart2 = null;
+let histMonth = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+})();
+let histSearchTimer = null;
 
 // Initialization
 document.addEventListener('DOMContentLoaded', async () => {
@@ -48,6 +53,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     });
 
+    // Setup history controls
+    document.getElementById('hist-prev').addEventListener('click', () => shiftHistMonth(-1));
+    document.getElementById('hist-next').addEventListener('click', () => shiftHistMonth(1));
+    document.getElementById('hist-category').addEventListener('change', loadHistory);
+    document.getElementById('hist-search').addEventListener('input', () => {
+        clearTimeout(histSearchTimer);
+        histSearchTimer = setTimeout(loadHistory, 350);
+    });
+    // Kategoriya filtri: harajat + kirim kategoriyalari (takrorlarsiz)
+    const histCat = document.getElementById('hist-category');
+    [...new Set([...EXPENSE_CATS, ...INCOME_CATS])].forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = c;
+        histCat.appendChild(opt);
+    });
+
     // Load data
     await loadDashboard();
     updateCategories();
@@ -73,6 +95,140 @@ function switchTab(tabId) {
     if (tabId === 'tab-stats') {
         const activeBtn = document.querySelector('.period-btn.active');
         loadStats(activeBtn ? activeBtn.dataset.period : 'week');
+    }
+    if (tabId === 'tab-history') loadHistory();
+    if (tabId === 'tab-family') loadFamily();
+}
+
+// ── History ──
+function shiftHistMonth(delta) {
+    const [y, m] = histMonth.split('-').map(Number);
+    const d = new Date(y, m - 1 + delta, 1);
+    histMonth = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    loadHistory();
+}
+
+async function loadHistory() {
+    document.getElementById('hist-month-label').textContent = histMonth;
+    const cat = encodeURIComponent(document.getElementById('hist-category').value);
+    const q = encodeURIComponent(document.getElementById('hist-search').value.trim());
+    try {
+        const res = await fetch(`${API_URL}/history?month=${histMonth}&category=${cat}&q=${q}`, { headers: HEADERS });
+        if (!res.ok) throw new Error('Tarix yuklashda xatolik');
+        const data = await res.json();
+
+        document.getElementById('hist-total-income').textContent = formatAmount(data.total_kirim || 0);
+        document.getElementById('hist-total-expense').textContent = formatAmount(data.total_harajat || 0);
+
+        const list = document.getElementById('hist-list');
+        list.innerHTML = '';
+
+        if (!data.items.length) {
+            const p = document.createElement('p');
+            p.style.cssText = 'color:var(--hint-color);text-align:center;padding:20px;';
+            p.textContent = 'Yozuv topilmadi';
+            list.appendChild(p);
+            return;
+        }
+
+        data.items.forEach(item => {
+            const row = document.createElement('div');
+            row.className = 'card-item';
+
+            const info = document.createElement('div');
+            info.className = 'card-info';
+            const name = document.createElement('span');
+            name.className = 'name';
+            name.textContent = item.category;
+            info.appendChild(name);
+            const sub = document.createElement('span');
+            sub.className = 'hist-sub';
+            const d = item.date || '';
+            const dateStr = d.length >= 16 ? `${d.slice(8, 10)}.${d.slice(5, 7)} ${d.slice(11, 16)}` : d;
+            sub.textContent = dateStr + (item.comment ? ` · ${item.comment}` : '') + (item.payment ? ` · ${item.payment}` : '');
+            info.appendChild(sub);
+            row.appendChild(info);
+
+            const right = document.createElement('div');
+            right.style.cssText = 'display:flex;align-items:center;gap:4px;';
+            const amt = document.createElement('span');
+            amt.className = 'hist-amount ' + (item.type === 'kirim' ? 'income' : 'expense');
+            amt.textContent = (item.type === 'kirim' ? '+' : '−') + formatAmount(item.amount);
+            right.appendChild(amt);
+
+            const del = document.createElement('button');
+            del.className = 'del-btn';
+            del.textContent = '🗑';
+            del.addEventListener('click', () => confirmDeleteTxn(item.id));
+            right.appendChild(del);
+            row.appendChild(right);
+
+            list.appendChild(row);
+        });
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+function confirmDeleteTxn(id) {
+    const doDelete = async () => {
+        try {
+            const res = await fetch(`${API_URL}/transaction/${id}`, { method: 'DELETE', headers: HEADERS });
+            if (!res.ok) throw new Error('failed');
+            try { tg.HapticFeedback.notificationOccurred('success'); } catch (e) {}
+            await loadHistory();
+            await loadDashboard();
+        } catch (e) {
+            tg.showAlert("O'chirishda xatolik yuz berdi");
+        }
+    };
+    if (tg.showConfirm) {
+        tg.showConfirm("Yozuv o'chirilib, balans qaytariladi. Davom etasizmi?", ok => { if (ok) doDelete(); });
+    } else if (confirm("O'chirasizmi?")) {
+        doDelete();
+    }
+}
+
+// ── Family ──
+async function loadFamily() {
+    try {
+        const res = await fetch(`${API_URL}/family`, { headers: HEADERS });
+        if (!res.ok) throw new Error('Oila maʼlumotini yuklashda xatolik');
+        const data = await res.json();
+
+        document.getElementById('fam-grand-total').textContent = formatAmount(data.grand_total || 0);
+        document.getElementById('fam-avo').textContent = formatAmount(data.avo || 0);
+        document.getElementById('fam-month-income').textContent = formatAmount(data.family_month_kirim || 0);
+        document.getElementById('fam-month-expense').textContent = formatAmount(data.family_month_harajat || 0);
+        document.getElementById('fam-month-title').textContent = `BU OY (${data.month}) — OILA`;
+
+        const listEl = document.getElementById('fam-users');
+        listEl.innerHTML = '';
+        (data.users || []).forEach(u => {
+            const row = document.createElement('div');
+            row.className = 'card-item';
+
+            const info = document.createElement('div');
+            info.className = 'card-info';
+            const name = document.createElement('span');
+            name.className = 'name';
+            name.textContent = '👤 ' + u.name;
+            info.appendChild(name);
+            const sub = document.createElement('span');
+            sub.className = 'hist-sub';
+            sub.textContent = `Bu oy: +${formatAmount(u.month_kirim)} · −${formatAmount(u.month_harajat)}`;
+            info.appendChild(sub);
+            row.appendChild(info);
+
+            const bal = document.createElement('span');
+            bal.className = 'card-balance';
+            bal.textContent = formatAmount(u.total);
+            row.appendChild(bal);
+
+            listEl.appendChild(row);
+        });
+    } catch (e) {
+        console.error(e);
     }
 }
 
