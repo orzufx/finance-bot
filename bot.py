@@ -1,3 +1,4 @@
+import calendar
 import logging
 import sqlite3
 import traceback
@@ -57,7 +58,14 @@ UTC5       = pytz.timezone("Asia/Tashkent")   # Toshkent vaqti
     TRANSFER_FROM,          # O'tkazma: qaysi kartadan
     TRANSFER_TO,            # O'tkazma: qaysi kartaga
     TRANSFER_AMOUNT,        # O'tkazma: miqdor
-) = range(22)
+    # Takrorlanuvchi to'lovlar (eslatmalar)
+    REC_MENU,               # Eslatmalar ro'yxati
+    REC_ADD_TITLE,          # Nomi (Kredit, Internet, ...)
+    REC_ADD_AMOUNT,         # Summasi
+    REC_ADD_DAY,            # Oyning qaysi kuni
+    REC_ADD_PAYMENT,        # To'lov usuli (AVO/Naqd/karta)
+    REC_ADD_CATEGORY,       # Harajat kategoriyasi
+) = range(28)
 
 
 # ─── Database Abstraction ────────────────────────────────────────────────────
@@ -164,6 +172,20 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS recurring_payments (
+                id             SERIAL PRIMARY KEY,
+                user_name      TEXT    NOT NULL,
+                title          TEXT    NOT NULL,
+                amount         REAL    NOT NULL,
+                day            INTEGER NOT NULL,
+                payment_method TEXT    NOT NULL DEFAULT '💵 Naqd',
+                category       TEXT    NOT NULL DEFAULT '📦 Boshqa',
+                card_id        INTEGER,
+                last_paid_ym   TEXT    NOT NULL DEFAULT '',
+                created_at     TEXT    NOT NULL
+            )
+        """)
     else:
         # SQLite Schema
         c.execute("""
@@ -220,7 +242,21 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-    
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS recurring_payments (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_name      TEXT    NOT NULL,
+                title          TEXT    NOT NULL,
+                amount         REAL    NOT NULL,
+                day            INTEGER NOT NULL,
+                payment_method TEXT    NOT NULL DEFAULT '💵 Naqd',
+                category       TEXT    NOT NULL DEFAULT '📦 Boshqa',
+                card_id        INTEGER,
+                last_paid_ym   TEXT    NOT NULL DEFAULT '',
+                created_at     TEXT    NOT NULL
+            )
+        """)
+
     conn.commit()
     conn.close()
 
@@ -402,6 +438,102 @@ def get_card_by_id(card_id: int):
     return row
 
 
+def adjust_card_balance(card_id: int, delta: float):
+    """Karta balansini atomik o'zgartiradi (delta < 0 — ayirish)."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE cards SET balance = balance + ? WHERE id=?", (delta, card_id))
+    conn.commit()
+    conn.close()
+
+
+# ─── Recurring Payments (Eslatmalar) ─────────────────────────────────────────
+def add_recurring(user_name, title, amount, day, payment_method, category, card_id=None):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO recurring_payments "
+        "(user_name, title, amount, day, payment_method, category, card_id, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (user_name, title, amount, day, payment_method, category, card_id,
+         datetime.now(UTC5).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recurring(user_name: str) -> list:
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
+        "FROM recurring_payments WHERE user_name=? ORDER BY day, id",
+        (user_name,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_recurring_by_id(rec_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
+        "FROM recurring_payments WHERE id=?",
+        (rec_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def delete_recurring(rec_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM recurring_payments WHERE id=?", (rec_id,))
+    conn.commit()
+    conn.close()
+
+
+def set_recurring_paid(rec_id: int, ym: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE recurring_payments SET last_paid_ym=? WHERE id=?", (ym, rec_id))
+    conn.commit()
+    conn.close()
+
+
+def get_recurring_due(today_day: int, last_day: int, ym: str) -> list:
+    """Bugun eslatilishi kerak bo'lganlar: kuni to'g'ri kelgan yoki
+    (oy qisqa bo'lsa) oyning oxirgi kunida day > last_day bo'lganlar."""
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
+        "FROM recurring_payments "
+        "WHERE last_paid_ym <> ? AND (day = ? OR (? = ? AND day > ?))",
+        (ym, today_day, today_day, last_day, last_day),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def record_recurring_payment(rec, ym: str) -> int:
+    """Eslatma to'lovini harajat sifatida yozadi, balansni kamaytiradi.
+    Yangi tranzaksiya id sini qaytaradi."""
+    rec_id, user_name, title, amount, _, payment_method, category, card_id, _ = rec
+    txn_id = save_transaction(user_name, "harajat", payment_method, category,
+                              amount, title, None, card_id)
+    if card_id:
+        adjust_card_balance(card_id, -amount)
+    else:
+        wtype = payment_to_wallet_type(payment_method)
+        if wtype:
+            w_user = AVO_USER if wtype == "avo" else user_name
+            adjust_wallet(w_user, wtype, -amount)
+    set_recurring_paid(rec_id, ym)
+    return txn_id
+
+
 # ─── Wallet (AVO / Naqd) Helpers ─────────────────────────────────────────────
 def get_wallet_balance(user_name: str, wallet_type: str) -> float:
     conn = get_conn()
@@ -502,6 +634,17 @@ def get_user_name(telegram_id: int) -> str:
     conn = get_conn()
     c = conn.cursor()
     row = c.execute("SELECT display_name FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_user_telegram_id(display_name: str):
+    """display_name bo'yicha telegram_id (eslatma yuborish uchun)."""
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT telegram_id FROM users WHERE display_name=?", (display_name,)
+    ).fetchone()
     conn.close()
     return row[0] if row else None
 
@@ -737,6 +880,39 @@ async def send_evening_summary(context):
         logger.error(f"[CHANNEL] Evening send failed: {e}")
 
 
+async def send_recurring_reminders(context):
+    """Har kuni 09:00 (Toshkent) — bugungi kunga tegishli eslatmalarni yuboradi."""
+    now      = datetime.now(UTC5)
+    ym       = now.strftime("%Y-%m")
+    last_day = calendar.monthrange(now.year, now.month)[1]
+
+    for rec in get_recurring_due(now.day, last_day, ym):
+        rec_id, user_name, title, amount, _day, pm, cat, _cid, _ym = rec
+        tg_id = get_user_telegram_id(user_name)
+        if not tg_id:
+            continue
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ To'landi — yozish", callback_data=f"rec_pay_{rec_id}")],
+            [InlineKeyboardButton("⏭ Bu oy emas",        callback_data=f"rec_skip_{rec_id}")],
+        ])
+        try:
+            await context.bot.send_message(
+                chat_id=tg_id,
+                text=(
+                    f"⏰ *Eslatma: {title}*\n\n"
+                    f"💵 `{format_amount(amount)}`\n"
+                    f"┌─ 💳 {pm}"
+                    f"\n└─ 📂 {cat}\n\n"
+                    f"Bugun to'lash kuni. To'lagan bo'lsangiz, tugma bilan yozib qo'ying:"
+                ),
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+            logger.info(f"[RECURRING] Eslatma yuborildi: {user_name} — {title}")
+        except Exception as e:
+            logger.warning(f"[RECURRING] {user_name} ({tg_id}) ga yuborilmadi: {e}")
+
+
 # ─── Texts ───────────────────────────────────────────────────────────────────
 TEXTS = {
     "uz": {
@@ -784,6 +960,25 @@ TEXTS = {
         "undo_btn":             "🗑 Oxirgi yozuvni bekor qilish",
         "undone":               "bekor qilindi, balans qaytarildi",
         "undo_gone":            "Bu yozuv allaqachon bekor qilingan",
+        # Recurring payments
+        "recurring_menu":       "⏰ Eslatmalar",
+        "rec_none":             "📭 Hali eslatma yo'q\n\n_Kredit, kommunal, obuna kabi oylik to'lovlarni qo'shing — bot o'z kunida eslatadi va bir bosishda yozib qo'yadi_",
+        "rec_add_btn":          "➕ Yangi eslatma",
+        "rec_title_prompt":     "✏️ *To'lov nomini kiriting:*\n_Masalan: Kredit, Internet, Obuna_",
+        "rec_amount_prompt":    "💵 *Oylik summani kiriting* (so'm):",
+        "rec_day_prompt":       "📅 *Oyning qaysi kuni eslatilsin?* (1–31)\n_31 kiritsangiz — qisqa oylarda oxirgi kunida eslatadi_",
+        "rec_pm_prompt":        "💳 *Qaysi manbadan to'lanadi?*",
+        "rec_cat_prompt":       "📂 *Harajat kategoriyasini tanlang:*",
+        "rec_saved":            "✅ Eslatma saqlandi!",
+        "rec_deleted":          "🗑 Eslatma o'chirildi",
+        "rec_del_confirm":      "o'chirishni tasdiqlaysizmi?",
+        "rec_day_label":        "har oyning {day}-kuni",
+        "rec_monthly_total":    "Jami oylik",
+        "invalid_day":          "❌ 1 dan 31 gacha son kiriting",
+        "rec_already":          "Bu oy allaqachon yozilgan",
+        "rec_not_found":        "Eslatma topilmadi",
+        "rec_paid":             "yozildi, balansdan ayirildi",
+        "rec_skipped":          "bu oy o'tkazib yuborildi",
     },
     "en": {
         "welcome":              "🏦 *Finance Bot*\n\nHello!\nPlease choose a language:",
@@ -830,6 +1025,25 @@ TEXTS = {
         "undo_btn":             "🗑 Undo last entry",
         "undone":               "cancelled, balance restored",
         "undo_gone":            "This entry has already been undone",
+        # Recurring payments
+        "recurring_menu":       "⏰ Reminders",
+        "rec_none":             "📭 No reminders yet\n\n_Add monthly payments like loans, utilities, subscriptions — the bot reminds you on the right day and records them in one tap_",
+        "rec_add_btn":          "➕ New reminder",
+        "rec_title_prompt":     "✏️ *Enter payment name:*\n_e.g. Loan, Internet, Subscription_",
+        "rec_amount_prompt":    "💵 *Enter monthly amount* (UZS):",
+        "rec_day_prompt":       "📅 *Which day of the month?* (1–31)\n_31 means the last day in shorter months_",
+        "rec_pm_prompt":        "💳 *Which source pays for it?*",
+        "rec_cat_prompt":       "📂 *Choose expense category:*",
+        "rec_saved":            "✅ Reminder saved!",
+        "rec_deleted":          "🗑 Reminder deleted",
+        "rec_del_confirm":      "delete this reminder?",
+        "rec_day_label":        "day {day} of every month",
+        "rec_monthly_total":    "Monthly total",
+        "invalid_day":          "❌ Enter a number from 1 to 31",
+        "rec_already":          "Already recorded this month",
+        "rec_not_found":        "Reminder not found",
+        "rec_paid":             "recorded, balance updated",
+        "rec_skipped":          "skipped this month",
     },
 }
 
@@ -1036,6 +1250,7 @@ def kb_main(ctx, undo_txn_id=None):
             [InlineKeyboardButton("📅  Boshqa kun uchun kiritish", callback_data="menu_another_date")],
             [InlineKeyboardButton("💳  Kartalarim", callback_data="menu_cards")],
             [InlineKeyboardButton("🔄  O'tkazma (Transfer)", callback_data="menu_transfer")],
+            [InlineKeyboardButton("⏰  Eslatmalar", callback_data="menu_recurring")],
             [InlineKeyboardButton("📈  Bugun", callback_data="report_today"),
              InlineKeyboardButton("📊  Hafta", callback_data="report_week"),
              InlineKeyboardButton("📆  Oy",    callback_data="report_month")],
@@ -1049,6 +1264,7 @@ def kb_main(ctx, undo_txn_id=None):
             [InlineKeyboardButton("📅  Add for another date", callback_data="menu_another_date")],
             [InlineKeyboardButton("💳  My Cards", callback_data="menu_cards")],
             [InlineKeyboardButton("🔄  Transfer", callback_data="menu_transfer")],
+            [InlineKeyboardButton("⏰  Reminders", callback_data="menu_recurring")],
             [InlineKeyboardButton("📈  Today", callback_data="report_today"),
              InlineKeyboardButton("📊  Week",  callback_data="report_week"),
              InlineKeyboardButton("📆  Month", callback_data="report_month")],
@@ -1182,6 +1398,61 @@ def kb_back(ctx, callback_data: str = "menu_back_main"):
     ])
 
 
+def build_recurring_text(user_name: str, ctx) -> str:
+    recs  = get_recurring(user_name)
+    title = f"*{t('recurring_menu', ctx)}*\n👤 {user_name}\n"
+    if not recs:
+        return title + "\n" + t("rec_none", ctx)
+    lines = [title]
+    total = 0
+    for _id, _u, rtitle, amount, day, pm, _cat, _cid, _ym in recs:
+        day_str = t("rec_day_label", ctx).format(day=day)
+        lines.append(f"⏰ *{rtitle}* — `{format_amount(amount)}`\n└─ 📅 {day_str} · {pm}")
+        total += amount
+    lines.append(f"\n💼 *{t('rec_monthly_total', ctx)}: `{format_amount(total)}`*")
+    return "\n".join(lines)
+
+
+def kb_recurring_menu(user_name: str, ctx):
+    buttons = []
+    for rec_id, _u, rtitle, _amt, day, *_ in get_recurring(user_name):
+        buttons.append([InlineKeyboardButton(
+            f"🗑 {rtitle} ({day})", callback_data=f"rec_item_{rec_id}"
+        )])
+    buttons.append([InlineKeyboardButton(t("rec_add_btn", ctx), callback_data="rec_add")])
+    buttons.append([InlineKeyboardButton(t("back", ctx), callback_data="menu_back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def kb_rec_payment(user_name: str, ctx):
+    """Eslatma uchun to'lov manbasi: AVO / Naqd / kartalar."""
+    l = lang(ctx)
+    buttons = [
+        [InlineKeyboardButton("🏛 AVO", callback_data="rec_pm_avo"),
+         InlineKeyboardButton("💵 Naqd" if l == "uz" else "💵 Cash",
+                              callback_data="rec_pm_naqd")],
+    ]
+    for card_id, name, number, _bal in get_cards(user_name):
+        num_str = f" ({mask_number(number)})" if number else ""
+        buttons.append([InlineKeyboardButton(
+            f"🏦 {name}{num_str}", callback_data=f"rec_pm_card_{card_id}"
+        )])
+    buttons.append([InlineKeyboardButton(t("back", ctx), callback_data="rec_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def kb_rec_categories(ctx):
+    cats = EXPENSE_CATEGORIES[lang(ctx)]
+    buttons = []
+    for i in range(0, len(cats), 2):
+        row = [InlineKeyboardButton(cats[i], callback_data=f"rec_cat_{cats[i]}")]
+        if i + 1 < len(cats):
+            row.append(InlineKeyboardButton(cats[i + 1], callback_data=f"rec_cat_{cats[i + 1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(t("back", ctx), callback_data="rec_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
 # ─── Handlers ────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
@@ -1280,6 +1551,15 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cards_menu(user_name, ctx),
         )
         return CARD_MENU
+
+    elif data == "menu_recurring":
+        user_name = ctx.user_data.get("user_name", "?")
+        await query.edit_message_text(
+            build_recurring_text(user_name, ctx),
+            parse_mode="Markdown",
+            reply_markup=kb_recurring_menu(user_name, ctx),
+        )
+        return REC_MENU
 
     elif data.startswith("report_"):
         period = data.split("_")[1]
@@ -1951,6 +2231,227 @@ async def msg_transfer_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 
+# ── Recurring Payments (Eslatmalar) ──
+async def _render_recurring_list(query, ctx, header: str = ""):
+    """Eslatmalar ro'yxatini chizadi (ixtiyoriy sarlavha bilan)."""
+    user_name = ctx.user_data.get("user_name", "?")
+    text = build_recurring_text(user_name, ctx)
+    if header:
+        text = f"{header}\n\n{text}"
+    await query.edit_message_text(
+        text, parse_mode="Markdown",
+        reply_markup=kb_recurring_menu(user_name, ctx),
+    )
+    return REC_MENU
+
+
+async def cb_rec_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "menu_back_main":
+        user_name = ctx.user_data.get("user_name", "?")
+        await query.edit_message_text(
+            f"👤 *{user_name}*\n━━━━━━━━━━━━━━━━━━━━━━\n📋 {t('main_menu', ctx)}",
+            parse_mode="Markdown",
+            reply_markup=kb_main(ctx),
+        )
+        return MAIN_MENU
+
+    elif data == "rec_add":
+        await query.edit_message_text(
+            t("rec_title_prompt", ctx), parse_mode="Markdown",
+            reply_markup=kb_back(ctx, "rec_back"),
+        )
+        return REC_ADD_TITLE
+
+    elif data.startswith("rec_item_"):
+        rec_id = int(data.split("rec_item_")[1])
+        rec = get_recurring_by_id(rec_id)
+        if not rec:
+            return await _render_recurring_list(query, ctx)
+        await query.edit_message_text(
+            f"🗑 *{rec[2]}* — `{format_amount(rec[3])}`\n\n{t('rec_del_confirm', ctx)}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(t("yes_delete", ctx), callback_data=f"rec_del_{rec_id}"),
+                InlineKeyboardButton(t("no_cancel", ctx),  callback_data="rec_back"),
+            ]]),
+        )
+        return REC_MENU
+
+    elif data.startswith("rec_del_"):
+        rec_id = int(data.split("rec_del_")[1])
+        delete_recurring(rec_id)
+        return await _render_recurring_list(query, ctx, header=t("rec_deleted", ctx))
+
+    elif data == "rec_back":
+        return await _render_recurring_list(query, ctx)
+
+    return REC_MENU
+
+
+async def cb_rec_back_to_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Qo'shish bosqichlaridan ro'yxatga qaytish."""
+    query = update.callback_query
+    await query.answer()
+    for key in ("new_rec_title", "new_rec_amount", "new_rec_day",
+                "new_rec_pm", "new_rec_card_id"):
+        ctx.user_data.pop(key, None)
+    return await _render_recurring_list(query, ctx)
+
+
+async def msg_rec_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["new_rec_title"] = update.message.text.strip()
+    await update.message.reply_text(
+        t("rec_amount_prompt", ctx), parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "rec_back"),
+    )
+    return REC_ADD_AMOUNT
+
+
+async def msg_rec_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", "").replace(" ", "")
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            t("invalid_number", ctx), reply_markup=kb_back(ctx, "rec_back")
+        )
+        return REC_ADD_AMOUNT
+
+    ctx.user_data["new_rec_amount"] = amount
+    await update.message.reply_text(
+        t("rec_day_prompt", ctx), parse_mode="Markdown",
+        reply_markup=kb_back(ctx, "rec_back"),
+    )
+    return REC_ADD_DAY
+
+
+async def msg_rec_day(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        day = int(update.message.text.strip())
+        if not 1 <= day <= 31:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            t("invalid_day", ctx), reply_markup=kb_back(ctx, "rec_back")
+        )
+        return REC_ADD_DAY
+
+    ctx.user_data["new_rec_day"] = day
+    user_name = ctx.user_data.get("user_name", "?")
+    await update.message.reply_text(
+        t("rec_pm_prompt", ctx), parse_mode="Markdown",
+        reply_markup=kb_rec_payment(user_name, ctx),
+    )
+    return REC_ADD_PAYMENT
+
+
+async def cb_rec_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    l    = lang(ctx)
+
+    if data == "rec_pm_avo":
+        pm, card_id = "🏛 AVO", None
+    elif data == "rec_pm_naqd":
+        pm, card_id = ("💵 Naqd" if l == "uz" else "💵 Cash"), None
+    else:  # rec_pm_card_<id>
+        card_id = int(data.split("rec_pm_card_")[1])
+        card = get_card_by_id(card_id)
+        if not card:
+            user_name = ctx.user_data.get("user_name", "?")
+            await query.edit_message_text(
+                t("rec_pm_prompt", ctx), parse_mode="Markdown",
+                reply_markup=kb_rec_payment(user_name, ctx),
+            )
+            return REC_ADD_PAYMENT
+        pm = f"💳 {card[1]}"
+
+    ctx.user_data["new_rec_pm"]      = pm
+    ctx.user_data["new_rec_card_id"] = card_id
+    await query.edit_message_text(
+        t("rec_cat_prompt", ctx), parse_mode="Markdown",
+        reply_markup=kb_rec_categories(ctx),
+    )
+    return REC_ADD_CATEGORY
+
+
+async def cb_rec_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    category  = query.data[len("rec_cat_"):]
+    user_name = ctx.user_data.get("user_name", "?")
+
+    add_recurring(
+        user_name,
+        ctx.user_data.pop("new_rec_title", "?"),
+        ctx.user_data.pop("new_rec_amount", 0),
+        ctx.user_data.pop("new_rec_day", 1),
+        ctx.user_data.pop("new_rec_pm", "💵 Naqd"),
+        category,
+        ctx.user_data.pop("new_rec_card_id", None),
+    )
+    return await _render_recurring_list(query, ctx, header=t("rec_saved", ctx))
+
+
+async def cb_recurring_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Eslatma xabaridagi tugmalar — suhbat holatidan mustaqil (global) ishlaydi."""
+    query   = update.callback_query
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await query.answer("🚫 Kirish taqiqlangan!", show_alert=True)
+        return
+
+    user_name = get_user_name(user_id)
+    rec_id    = int(query.data.rsplit("_", 1)[1])
+    rec       = get_recurring_by_id(rec_id)
+
+    if not rec or rec[1] != user_name:
+        await query.answer(t("rec_not_found", ctx), show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    title, amount = rec[2], rec[3]
+
+    if query.data.startswith("rec_skip_"):
+        await query.answer()
+        await query.edit_message_text(
+            f"⏭ *{title}* — {t('rec_skipped', ctx)}", parse_mode="Markdown"
+        )
+        return
+
+    ym = datetime.now(UTC5).strftime("%Y-%m")
+    if rec[8] == ym:
+        await query.answer(t("rec_already", ctx), show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    record_recurring_payment(rec, ym)
+    await query.answer()
+    await query.edit_message_text(
+        f"✅ *{title}* — `{format_amount(amount)}` {t('rec_paid', ctx)}\n"
+        f"┌─ 💳 {rec[5]}"
+        f"\n└─ 📂 {rec[6]}",
+        parse_mode="Markdown",
+    )
+    try:
+        await update_channel_message(ctx.bot)
+    except Exception as e:
+        logger.warning(f"[CHANNEL] Update skipped: {e}")
+
+
 # ── Card Menu ──
 async def cb_card_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2391,6 +2892,33 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_transfer_amount),
                 CallbackQueryHandler(cb_transfer_amount_back, pattern="^trf_back_to_select$"),
             ],
+            # Recurring payment states
+            REC_MENU: [
+                CallbackQueryHandler(
+                    cb_rec_menu,
+                    pattern="^(rec_add$|rec_item_|rec_del_|rec_back$|menu_back_main$)",
+                ),
+            ],
+            REC_ADD_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_rec_title),
+                CallbackQueryHandler(cb_rec_back_to_list, pattern="^rec_back$"),
+            ],
+            REC_ADD_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_rec_amount),
+                CallbackQueryHandler(cb_rec_back_to_list, pattern="^rec_back$"),
+            ],
+            REC_ADD_DAY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_rec_day),
+                CallbackQueryHandler(cb_rec_back_to_list, pattern="^rec_back$"),
+            ],
+            REC_ADD_PAYMENT: [
+                CallbackQueryHandler(cb_rec_payment, pattern="^rec_pm_"),
+                CallbackQueryHandler(cb_rec_back_to_list, pattern="^rec_back$"),
+            ],
+            REC_ADD_CATEGORY: [
+                CallbackQueryHandler(cb_rec_category, pattern="^rec_cat_"),
+                CallbackQueryHandler(cb_rec_back_to_list, pattern="^rec_back$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_user=True,
@@ -2399,6 +2927,10 @@ def main():
     )
 
     app.add_handler(conv)
+
+    # Eslatma tugmalari suhbatdan tashqarida ham ishlashi kerak
+    # (eslatma xabari istalgan paytda keladi, hatto bot restartidan keyin ham)
+    app.add_handler(CallbackQueryHandler(cb_recurring_action, pattern=r"^rec_(pay|skip)_\d+$"))
 
     # Ruxsatsiz foydalanuvchilar uchun yopuvchi handler
     async def _unauthorized(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2426,6 +2958,12 @@ def main():
         send_evening_summary,
         time=dt_time(hour=18, minute=55, second=0, tzinfo=timezone.utc),
         name="evening_summary",
+    )
+    # 09:00 Toshkent (UTC+5) = 04:00 UTC — takrorlanuvchi to'lov eslatmalari
+    jq.run_daily(
+        send_recurring_reminders,
+        time=dt_time(hour=4, minute=0, second=0, tzinfo=timezone.utc),
+        name="recurring_reminders",
     )
     logger.info("Finance Bot ishga tushdi ✅ | Kanal xabarlari rejalashtirildi")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
