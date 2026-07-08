@@ -55,6 +55,8 @@ def get_user_name(telegram_id):
     finally:
         conn.close()
 
+ALLOWED_USER_IDS = {5701684264, 6392413373, 7064655656}
+
 def require_auth(f):
     def wrapper(*args, **kwargs):
         auth_header = request.headers.get("Authorization")
@@ -67,9 +69,14 @@ def require_auth(f):
             return jsonify({"error": "Invalid init data"}), 401
             
         telegram_id = user_data.get("id")
+        if telegram_id not in ALLOWED_USER_IDS:
+            return jsonify({"error": "Sizga bu botdan foydalanishga ruxsat yo'q."}), 403
+            
         user_name = get_user_name(telegram_id)
         if not user_name:
-            return jsonify({"error": "User not registered"}), 403
+            user_name = user_data.get("first_name", "Foydalanuvchi")
+            from bot import register_user
+            register_user(telegram_id, user_name)
             
         return f(user_name, *args, **kwargs)
     wrapper.__name__ = f.__name__
