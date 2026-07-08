@@ -126,10 +126,12 @@ def init_db():
                 category       TEXT    NOT NULL,
                 amount         REAL    NOT NULL,
                 comment        TEXT,
-                created_at     TEXT    NOT NULL
+                created_at     TEXT    NOT NULL,
+                card_id        INTEGER
             )
         """)
         c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT ''")
+        c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS card_id INTEGER")
         c.execute("""
             CREATE TABLE IF NOT EXISTS cards (
                 id          SERIAL PRIMARY KEY,
@@ -173,11 +175,16 @@ def init_db():
                 category       TEXT    NOT NULL,
                 amount         REAL    NOT NULL,
                 comment        TEXT,
-                created_at     TEXT    NOT NULL
+                created_at     TEXT    NOT NULL,
+                card_id        INTEGER
             )
         """)
         try:
             c.execute("ALTER TABLE transactions ADD COLUMN payment_method TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            c.execute("ALTER TABLE transactions ADD COLUMN card_id INTEGER")
         except sqlite3.OperationalError:
             pass  # Column already exists
     
@@ -221,19 +228,61 @@ def init_db():
 
 # ── Transactions ──
 def save_transaction(user_name, trans_type, payment_method, category,
-                     amount, comment="", created_at=None):
+                     amount, comment="", created_at=None, card_id=None):
+    """Yozuvni saqlab, yangi tranzaksiya id sini qaytaradi (bekor qilish uchun)."""
     conn = get_conn()
     c = conn.cursor()
     if created_at is None:
         created_at = datetime.now(UTC5).isoformat()
-    c.execute(
+    q = (
         "INSERT INTO transactions "
-        "(user_name, type, payment_method, category, amount, comment, created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (user_name, trans_type, payment_method, category, amount, comment, created_at),
+        "(user_name, type, payment_method, category, amount, comment, created_at, card_id) "
+        "VALUES (?,?,?,?,?,?,?,?)"
     )
+    params = (user_name, trans_type, payment_method, category, amount, comment, created_at, card_id)
+    if DATABASE_URL:
+        txn_id = c.execute(q + " RETURNING id", params).fetchone()[0]
+    else:
+        c.execute(q, params)
+        txn_id = c.lastrowid
     conn.commit()
     conn.close()
+    return txn_id
+
+
+def delete_transaction_and_refund(txn_id: int, user_name: str):
+    """Tranzaksiyani o'chirib, karta/hamyon balansini qaytaradi.
+
+    Muvaffaqiyatda o'chirilgan yozuvni, topilmasa (yoki begona bo'lsa) None qaytaradi.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT id, user_name, type, payment_method, category, amount, card_id, created_at "
+        "FROM transactions WHERE id=?",
+        (txn_id,),
+    ).fetchone()
+    if not row or row[1] != user_name:
+        conn.close()
+        return None
+
+    _, _, trans_type, payment_method, _, amount, card_id, _ = row
+    # Saqlashda qo'llangan o'zgarishning teskarisi
+    delta = amount if trans_type == "kirim" else -amount
+    if card_id:
+        c.execute("UPDATE cards SET balance = balance - ? WHERE id=?", (delta, card_id))
+    else:
+        wtype = payment_to_wallet_type(payment_method)
+        if wtype:
+            w_user = AVO_USER if wtype == "avo" else user_name
+            c.execute(
+                "UPDATE wallets SET balance = balance - ? WHERE user_name=? AND wallet_type=?",
+                (delta, w_user, wtype),
+            )
+    c.execute("DELETE FROM transactions WHERE id=?", (txn_id,))
+    conn.commit()
+    conn.close()
+    return row
 
 
 def get_summary(user_name: str, period: str) -> dict:
@@ -732,6 +781,9 @@ TEXTS = {
         "select_payment_card":  "💳 *Qaysi karta orqali to'ladingiz?*",
         "no_cards_for_payment": "📭 Sizda karta yo'q\n_Kartalar bo'limidan avval karta qo'shing_",
         "card_deducted":        "yangi balans →",
+        "undo_btn":             "🗑 Oxirgi yozuvni bekor qilish",
+        "undone":               "bekor qilindi, balans qaytarildi",
+        "undo_gone":            "Bu yozuv allaqachon bekor qilingan",
     },
     "en": {
         "welcome":              "🏦 *Finance Bot*\n\nHello!\nPlease choose a language:",
@@ -775,6 +827,9 @@ TEXTS = {
         "select_payment_card":  "💳 *Which card did you pay with?*",
         "no_cards_for_payment": "📭 You have no cards\n_Add a card in the Cards section first_",
         "card_deducted":        "new balance →",
+        "undo_btn":             "🗑 Undo last entry",
+        "undone":               "cancelled, balance restored",
+        "undo_gone":            "This entry has already been undone",
     },
 }
 
@@ -969,7 +1024,7 @@ def build_cards_text(user_name: str, ctx) -> str:
 
 
 # ─── Keyboards ───────────────────────────────────────────────────────────────
-def kb_main(ctx):
+def kb_main(ctx, undo_txn_id=None):
     l         = lang(ctx)
     user_name = ctx.user_data.get("user_name", "")
     web_app_url = "https://orzu-finance-bot-ab68cb0dfc9f.herokuapp.com"
@@ -999,6 +1054,10 @@ def kb_main(ctx):
              InlineKeyboardButton("📆  Month", callback_data="report_month")],
             [InlineKeyboardButton("🌐  Language", callback_data="change_language")],
         ]
+    if undo_txn_id:
+        rows.insert(0, [InlineKeyboardButton(
+            t("undo_btn", ctx), callback_data=f"undo_{undo_txn_id}"
+        )])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1609,11 +1668,13 @@ def _save_and_deduct(ctx, comment):
     user_name      = ctx.user_data.get("user_name", "unknown")
     custom_date    = ctx.user_data.get("custom_date")
     created_at     = f"{custom_date}T12:00:00" if custom_date else None
+    card_id        = ctx.user_data.get("expense_card_id")
 
-    save_transaction(user_name, trans_type, payment_method, category, amount, comment, created_at)
+    txn_id = save_transaction(user_name, trans_type, payment_method, category,
+                              amount, comment, created_at, card_id)
+    ctx.user_data["_last_txn_id"] = txn_id
 
     # ── Shaxsiy karta uchun balans ayirish
-    card_id = ctx.user_data.get("expense_card_id")
     if card_id:
         card = get_card_by_id(card_id)
         if card:
@@ -1661,13 +1722,53 @@ async def _show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"\n└─ 📂 {category}{card_note}"
         f"\n\n👤 *{user_name}* · 📋 {menu_label}"
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_main(ctx))
+    last_txn_id = ctx.user_data.pop("_last_txn_id", None)
+    await update.message.reply_text(
+        text, parse_mode="Markdown",
+        reply_markup=kb_main(ctx, undo_txn_id=last_txn_id),
+    )
     # Kanal xabarini yangilash (fon, xato bo'lsa ham davom etadi)
     # custom_date hali ctx.user_data da bor (endi o'chiramiz)
     saved_custom_date = ctx.user_data.pop("custom_date", None)
     ctx.user_data.pop("custom_date_display", None)
     try:
         await update_channel_message(ctx.bot, target_date=saved_custom_date)
+    except Exception as e:
+        logger.warning(f"[CHANNEL] Update skipped: {e}")
+    return MAIN_MENU
+
+
+async def cb_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Saqlangan tranzaksiyani bekor qiladi: yozuv o'chadi, balans qaytadi."""
+    query     = update.callback_query
+    user_name = ctx.user_data.get("user_name", "?")
+    txn_id    = int(query.data.split("undo_")[1])
+
+    row = delete_transaction_and_refund(txn_id, user_name)
+    if row is None:
+        await query.answer(t("undo_gone", ctx), show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=kb_main(ctx))
+        except Exception:
+            pass  # xabar allaqachon o'zgartirilgan bo'lishi mumkin
+        return MAIN_MENU
+
+    await query.answer()
+    _, _, trans_type, payment_method, category, amount, _, created_at = row
+    type_emoji = "💸" if trans_type == "harajat" else "💰"
+    menu_label = t("main_menu", ctx)
+    await query.edit_message_text(
+        f"🗑 *{format_amount(amount)}* {t('undone', ctx)}\n"
+        f"┌─ {type_emoji} {payment_method}"
+        f"\n└─ 📂 {category}"
+        f"\n\n👤 *{user_name}* · 📋 {menu_label}",
+        parse_mode="Markdown",
+        reply_markup=kb_main(ctx),
+    )
+    # Kanalni tranzaksiya sanasi bo'yicha yangilaymiz (o'tgan kun bo'lsa ham)
+    txn_date = (created_at or "")[:10] or None
+    try:
+        await update_channel_message(ctx.bot, target_date=txn_date)
     except Exception as e:
         logger.warning(f"[CHANNEL] Update skipped: {e}")
     return MAIN_MENU
@@ -2185,6 +2286,7 @@ def main():
                     cb_main_menu,
                     pattern="^(menu_|report_|change_)",
                 ),
+                CallbackQueryHandler(cb_undo, pattern=r"^undo_\d+$"),
             ],
             ANOTHER_DATE_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_another_date_input),

@@ -85,8 +85,10 @@ def init_db():
                 category TEXT,
                 amount REAL,
                 comment TEXT,
-                created_at TEXT
+                created_at TEXT,
+                card_id INTEGER
             )""")
+            c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS card_id INTEGER")
         else:
             c.execute("""CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,8 +123,13 @@ def init_db():
                 category TEXT,
                 amount REAL,
                 comment TEXT,
-                created_at TEXT
+                created_at TEXT,
+                card_id INTEGER
             )""")
+            try:
+                c.execute("ALTER TABLE transactions ADD COLUMN card_id INTEGER")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         conn.commit()
     finally:
         conn.close()
@@ -321,8 +328,8 @@ def add_transaction(user_name):
     c = conn.cursor()
     try:
         # Save transaction
-        q_ins = "INSERT INTO transactions (user_name, type, payment_method, category, amount, comment, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)" if DATABASE_URL else "INSERT INTO transactions (user_name, type, payment_method, category, amount, comment, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        c.execute(q_ins, (user_name, trans_type, payment_method, category, amount, comment, created_at))
+        q_ins = "INSERT INTO transactions (user_name, type, payment_method, category, amount, comment, created_at, card_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)" if DATABASE_URL else "INSERT INTO transactions (user_name, type, payment_method, category, amount, comment, created_at, card_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        c.execute(q_ins, (user_name, trans_type, payment_method, category, amount, comment, created_at, card_id))
 
         # Adjust balances
         delta = amount if trans_type == "kirim" else -amount
