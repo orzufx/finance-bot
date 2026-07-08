@@ -94,7 +94,10 @@ function updateCategories() {
 async function loadDashboard() {
     try {
         const res = await fetch(`${API_URL}/dashboard`, { headers: HEADERS });
-        if(!res.ok) throw new Error('API Error');
+        if(!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            throw new Error(errData.error || 'Server bilan ulanishda xatolik');
+        }
         const data = await res.json();
         
         // Balances
@@ -139,7 +142,13 @@ async function loadDashboard() {
 
     } catch (e) {
         console.error(e);
-        tg.showAlert("Ma'lumotlarni yuklashda xatolik yuz berdi.");
+        document.getElementById('tab-dashboard').innerHTML = `
+            <div style="text-align:center; padding: 40px 20px;">
+                <h2 style="color: var(--expense-color); margin-bottom: 10px;">Xatolik!</h2>
+                <p style="color: var(--hint-color);">${e.message}</p>
+                <p style="color: var(--hint-color); margin-top: 20px;">Botga qaytib /start ni bosing va ismingizni kiritib ro'yxatdan o'ting.</p>
+            </div>
+        `;
     }
 }
 
