@@ -21,7 +21,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8607311771:AAHSFXsq9usGf4GxQcvhf-PNbB0I
 def get_conn():
     if DATABASE_URL:
         import psycopg2
-        return psycopg2.connect(DATABASE_URL)
+        return psycopg2.connect(DATABASE_URL, sslmode='require')
     else:
         return sqlite3.connect("finance.db")
 
