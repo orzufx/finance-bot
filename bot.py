@@ -1987,11 +1987,8 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start, filters=filters.User(list(ALLOWED_USER_IDS)))],
         states={
-            LANG_SELECT: [
-                CallbackQueryHandler(cb_lang, pattern="^lang_"),
-            ],
-            USER_SELECT: [
-                CallbackQueryHandler(cb_user, pattern="^user_"),
+            REGISTER_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_register_name),
             ],
             MAIN_MENU: [
                 CallbackQueryHandler(
