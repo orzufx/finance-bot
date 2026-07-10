@@ -2,12 +2,15 @@ import calendar
 import csv
 import io
 import logging
+import os
 import re
 import sqlite3
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timedelta, time as dt_time, timezone
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -79,8 +82,19 @@ def get_pg_pool():
     if _pg_pool is None and DATABASE_URL:
         from psycopg2.pool import ThreadedConnectionPool
         # bot.py + server.py birgalikda Heroku'ning 20 talik ulanish
-        # cheklovidan oshmasligi uchun har biriga maksimum 5 ta
-        _pg_pool = ThreadedConnectionPool(1, 5, DATABASE_URL, sslmode='require')
+        # cheklovidan oshmasligi uchun har biriga maksimum 5 ta.
+        # Timeout/keepalive'larsiz o'lik ulanishdagi so'rov event loop'ni
+        # 15-30 daqiqa muzlatib qo'yishi mumkin (TCP retransmission).
+        _pg_pool = ThreadedConnectionPool(
+            1, 5, DATABASE_URL,
+            sslmode='require',
+            connect_timeout=5,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
+            options='-c statement_timeout=15000',
+        )
     return _pg_pool
 
 class PostgresCursorWrapper:
@@ -102,14 +116,22 @@ class PostgresCursorWrapper:
 class PostgresConnWrapper:
     def __init__(self, conn):
         self._conn = conn
+        self._returned = False
     def cursor(self):
         return PostgresCursorWrapper(self._conn.cursor())
     def commit(self): self._conn.commit()
     def close(self):
-        if DATABASE_URL:
+        # Idempotent: ikki marta chaqirilsa ham pool buzilmaydi
+        if self._returned:
+            return
+        self._returned = True
+        try:
             get_pg_pool().putconn(self._conn)
-        else:
-            self._conn.close()
+        except Exception:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
     def execute(self, query, params=()):
         c = self.cursor()
         c.execute(query, params)
@@ -117,151 +139,178 @@ class PostgresConnWrapper:
 
 def get_conn():
     if DATABASE_URL:
-        conn = get_pg_pool().getconn()
+        pool = get_pg_pool()
+        conn = pool.getconn()
+        # Pool'dan olingan ulanish o'lik bo'lishi mumkin (PG failover,
+        # tungi uzilish) — arzon ping bilan tekshirib, yangisiga almashtiramiz
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            conn.rollback()
+        except Exception:
+            logger.warning("O'lik PG ulanish topildi — yangisiga almashtirildi")
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            conn = pool.getconn()
         return PostgresConnWrapper(conn)
     else:
         return sqlite3.connect("finance.db")
 
-def init_db():
-    conn = get_conn()
-    c = conn.cursor()
-    
-    if DATABASE_URL:
-        # PostgreSQL Schema
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id             SERIAL PRIMARY KEY,
-                user_name      TEXT    NOT NULL,
-                type           TEXT    NOT NULL,
-                payment_method TEXT    NOT NULL DEFAULT '',
-                category       TEXT    NOT NULL,
-                amount         REAL    NOT NULL,
-                comment        TEXT,
-                created_at     TEXT    NOT NULL,
-                card_id        INTEGER
-            )
-        """)
-        c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT ''")
-        c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS card_id INTEGER")
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS cards (
-                id          SERIAL PRIMARY KEY,
-                user_name   TEXT    NOT NULL,
-                card_name   TEXT    NOT NULL,
-                card_number TEXT    NOT NULL DEFAULT '',
-                balance     REAL    NOT NULL DEFAULT 0,
-                created_at  TEXT    NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS wallets (
-                id          SERIAL PRIMARY KEY,
-                user_name   TEXT    NOT NULL,
-                wallet_type TEXT    NOT NULL,
-                balance     REAL    NOT NULL DEFAULT 0,
-                UNIQUE(user_name, wallet_type)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id BIGINT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS recurring_payments (
-                id             SERIAL PRIMARY KEY,
-                user_name      TEXT    NOT NULL,
-                title          TEXT    NOT NULL,
-                amount         REAL    NOT NULL,
-                day            INTEGER NOT NULL,
-                payment_method TEXT    NOT NULL DEFAULT '💵 Naqd',
-                category       TEXT    NOT NULL DEFAULT '📦 Boshqa',
-                card_id        INTEGER,
-                last_paid_ym   TEXT    NOT NULL DEFAULT '',
-                created_at     TEXT    NOT NULL
-            )
-        """)
-    else:
-        # SQLite Schema
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_name      TEXT    NOT NULL,
-                type           TEXT    NOT NULL,
-                payment_method TEXT    NOT NULL DEFAULT '',
-                category       TEXT    NOT NULL,
-                amount         REAL    NOT NULL,
-                comment        TEXT,
-                created_at     TEXT    NOT NULL,
-                card_id        INTEGER
-            )
-        """)
-        try:
-            c.execute("ALTER TABLE transactions ADD COLUMN payment_method TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        try:
-            c.execute("ALTER TABLE transactions ADD COLUMN card_id INTEGER")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-    
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS cards (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_name   TEXT    NOT NULL,
-                card_name   TEXT    NOT NULL,
-                card_number TEXT    NOT NULL DEFAULT '',
-                balance     REAL    NOT NULL DEFAULT 0,
-                created_at  TEXT    NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS wallets (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_name   TEXT    NOT NULL,
-                wallet_type TEXT    NOT NULL,
-                balance     REAL    NOT NULL DEFAULT 0,
-                UNIQUE(user_name, wallet_type)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS recurring_payments (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_name      TEXT    NOT NULL,
-                title          TEXT    NOT NULL,
-                amount         REAL    NOT NULL,
-                day            INTEGER NOT NULL,
-                payment_method TEXT    NOT NULL DEFAULT '💵 Naqd',
-                category       TEXT    NOT NULL DEFAULT '📦 Boshqa',
-                card_id        INTEGER,
-                last_paid_ym   TEXT    NOT NULL DEFAULT '',
-                created_at     TEXT    NOT NULL
-            )
-        """)
 
-    conn.commit()
-    conn.close()
+@contextmanager
+def db_conn():
+    """Ulanishni xato bo'lsa ham albatta pool'ga qaytaradi (leak'ka qarshi)."""
+    _c = get_conn()
+    try:
+        yield _c
+    finally:
+        try:
+            _c.close()
+        except Exception:
+            logger.warning("DB ulanishni qaytarib bo'lmadi", exc_info=True)
+
+def init_db():
+    with db_conn() as conn:
+        c = conn.cursor()
+
+        if DATABASE_URL:
+            # PostgreSQL Schema
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id             SERIAL PRIMARY KEY,
+                    user_name      TEXT    NOT NULL,
+                    type           TEXT    NOT NULL,
+                    payment_method TEXT    NOT NULL DEFAULT '',
+                    category       TEXT    NOT NULL,
+                    amount         REAL    NOT NULL,
+                    comment        TEXT,
+                    created_at     TEXT    NOT NULL,
+                    card_id        INTEGER
+                )
+            """)
+            c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT ''")
+            c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS card_id INTEGER")
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS cards (
+                    id          SERIAL PRIMARY KEY,
+                    user_name   TEXT    NOT NULL,
+                    card_name   TEXT    NOT NULL,
+                    card_number TEXT    NOT NULL DEFAULT '',
+                    balance     REAL    NOT NULL DEFAULT 0,
+                    created_at  TEXT    NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id          SERIAL PRIMARY KEY,
+                    user_name   TEXT    NOT NULL,
+                    wallet_type TEXT    NOT NULL,
+                    balance     REAL    NOT NULL DEFAULT 0,
+                    UNIQUE(user_name, wallet_type)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS recurring_payments (
+                    id             SERIAL PRIMARY KEY,
+                    user_name      TEXT    NOT NULL,
+                    title          TEXT    NOT NULL,
+                    amount         REAL    NOT NULL,
+                    day            INTEGER NOT NULL,
+                    payment_method TEXT    NOT NULL DEFAULT '💵 Naqd',
+                    category       TEXT    NOT NULL DEFAULT '📦 Boshqa',
+                    card_id        INTEGER,
+                    last_paid_ym   TEXT    NOT NULL DEFAULT '',
+                    created_at     TEXT    NOT NULL
+                )
+            """)
+        else:
+            # SQLite Schema
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_name      TEXT    NOT NULL,
+                    type           TEXT    NOT NULL,
+                    payment_method TEXT    NOT NULL DEFAULT '',
+                    category       TEXT    NOT NULL,
+                    amount         REAL    NOT NULL,
+                    comment        TEXT,
+                    created_at     TEXT    NOT NULL,
+                    card_id        INTEGER
+                )
+            """)
+            try:
+                c.execute("ALTER TABLE transactions ADD COLUMN payment_method TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                c.execute("ALTER TABLE transactions ADD COLUMN card_id INTEGER")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS cards (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_name   TEXT    NOT NULL,
+                    card_name   TEXT    NOT NULL,
+                    card_number TEXT    NOT NULL DEFAULT '',
+                    balance     REAL    NOT NULL DEFAULT 0,
+                    created_at  TEXT    NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_name   TEXT    NOT NULL,
+                    wallet_type TEXT    NOT NULL,
+                    balance     REAL    NOT NULL DEFAULT 0,
+                    UNIQUE(user_name, wallet_type)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS recurring_payments (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_name      TEXT    NOT NULL,
+                    title          TEXT    NOT NULL,
+                    amount         REAL    NOT NULL,
+                    day            INTEGER NOT NULL,
+                    payment_method TEXT    NOT NULL DEFAULT '💵 Naqd',
+                    category       TEXT    NOT NULL DEFAULT '📦 Boshqa',
+                    card_id        INTEGER,
+                    last_paid_ym   TEXT    NOT NULL DEFAULT '',
+                    created_at     TEXT    NOT NULL
+                )
+            """)
+
+        conn.commit()
 
 
 
@@ -269,23 +318,22 @@ def init_db():
 def save_transaction(user_name, trans_type, payment_method, category,
                      amount, comment="", created_at=None, card_id=None):
     """Yozuvni saqlab, yangi tranzaksiya id sini qaytaradi (bekor qilish uchun)."""
-    conn = get_conn()
-    c = conn.cursor()
-    if created_at is None:
-        created_at = datetime.now(UTC5).isoformat()
-    q = (
-        "INSERT INTO transactions "
-        "(user_name, type, payment_method, category, amount, comment, created_at, card_id) "
-        "VALUES (?,?,?,?,?,?,?,?)"
-    )
-    params = (user_name, trans_type, payment_method, category, amount, comment, created_at, card_id)
-    if DATABASE_URL:
-        txn_id = c.execute(q + " RETURNING id", params).fetchone()[0]
-    else:
-        c.execute(q, params)
-        txn_id = c.lastrowid
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        if created_at is None:
+            created_at = datetime.now(UTC5).isoformat()
+        q = (
+            "INSERT INTO transactions "
+            "(user_name, type, payment_method, category, amount, comment, created_at, card_id) "
+            "VALUES (?,?,?,?,?,?,?,?)"
+        )
+        params = (user_name, trans_type, payment_method, category, amount, comment, created_at, card_id)
+        if DATABASE_URL:
+            txn_id = c.execute(q + " RETURNING id", params).fetchone()[0]
+        else:
+            c.execute(q, params)
+            txn_id = c.lastrowid
+        conn.commit()
     return txn_id
 
 
@@ -294,64 +342,61 @@ def delete_transaction_and_refund(txn_id: int, user_name: str):
 
     Muvaffaqiyatda o'chirilgan yozuvni, topilmasa (yoki begona bo'lsa) None qaytaradi.
     """
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT id, user_name, type, payment_method, category, amount, card_id, created_at "
-        "FROM transactions WHERE id=?",
-        (txn_id,),
-    ).fetchone()
-    if not row or row[1] != user_name:
-        conn.close()
-        return None
+    with db_conn() as conn:
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT id, user_name, type, payment_method, category, amount, card_id, created_at "
+            "FROM transactions WHERE id=?",
+            (txn_id,),
+        ).fetchone()
+        if not row or row[1] != user_name:
+            return None
 
-    _, _, trans_type, payment_method, _, amount, card_id, _ = row
-    # Saqlashda qo'llangan o'zgarishning teskarisi
-    delta = amount if trans_type == "kirim" else -amount
-    if card_id:
-        c.execute("UPDATE cards SET balance = balance - ? WHERE id=?", (delta, card_id))
-    else:
-        wtype = payment_to_wallet_type(payment_method)
-        if wtype:
-            w_user = AVO_USER if wtype == "avo" else user_name
-            c.execute(
-                "UPDATE wallets SET balance = balance - ? WHERE user_name=? AND wallet_type=?",
-                (delta, w_user, wtype),
-            )
-    c.execute("DELETE FROM transactions WHERE id=?", (txn_id,))
-    conn.commit()
-    conn.close()
+        _, _, trans_type, payment_method, _, amount, card_id, _ = row
+        # Saqlashda qo'llangan o'zgarishning teskarisi
+        delta = amount if trans_type == "kirim" else -amount
+        if card_id:
+            c.execute("UPDATE cards SET balance = balance - ? WHERE id=?", (delta, card_id))
+        else:
+            wtype = payment_to_wallet_type(payment_method)
+            if wtype:
+                w_user = AVO_USER if wtype == "avo" else user_name
+                c.execute(
+                    "UPDATE wallets SET balance = balance - ? WHERE user_name=? AND wallet_type=?",
+                    (delta, w_user, wtype),
+                )
+        c.execute("DELETE FROM transactions WHERE id=?", (txn_id,))
+        conn.commit()
     return row
 
 
 def get_summary(user_name: str, period: str) -> dict:
-    conn = get_conn()
-    c = conn.cursor()
-    now = datetime.now(UTC5)
-    if period == "today":
-        since = now.strftime("%Y-%m-%d")
-        rows = c.execute(
-            "SELECT type, SUM(amount) FROM transactions "
-            "WHERE user_name=? AND created_at LIKE ? GROUP BY type",
-            (user_name, f"{since}%"),
-        ).fetchall()
-    elif period == "week":
-        week_start = (now - timedelta(days=now.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        rows = c.execute(
-            "SELECT type, SUM(amount) FROM transactions "
-            "WHERE user_name=? AND created_at >= ? GROUP BY type",
-            (user_name, week_start.isoformat()),
-        ).fetchall()
-    else:  # month
-        since = now.strftime("%Y-%m")
-        rows = c.execute(
-            "SELECT type, SUM(amount) FROM transactions "
-            "WHERE user_name=? AND created_at LIKE ? GROUP BY type",
-            (user_name, f"{since}%"),
-        ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        now = datetime.now(UTC5)
+        if period == "today":
+            since = now.strftime("%Y-%m-%d")
+            rows = c.execute(
+                "SELECT type, SUM(amount) FROM transactions "
+                "WHERE user_name=? AND created_at LIKE ? GROUP BY type",
+                (user_name, f"{since}%"),
+            ).fetchall()
+        elif period == "week":
+            week_start = (now - timedelta(days=now.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            rows = c.execute(
+                "SELECT type, SUM(amount) FROM transactions "
+                "WHERE user_name=? AND created_at >= ? GROUP BY type",
+                (user_name, week_start.isoformat()),
+            ).fetchall()
+        else:  # month
+            since = now.strftime("%Y-%m")
+            rows = c.execute(
+                "SELECT type, SUM(amount) FROM transactions "
+                "WHERE user_name=? AND created_at LIKE ? GROUP BY type",
+                (user_name, f"{since}%"),
+            ).fetchall()
     result = {"harajat": 0, "kirim": 0}
     for tp, s in rows:
         result[tp] = s or 0
@@ -360,163 +405,150 @@ def get_summary(user_name: str, period: str) -> dict:
 
 def get_transactions_for_period(user_name: str, period: str) -> list:
     """Returns list of (type, payment_method, category, amount, comment, created_at)."""
-    conn = get_conn()
-    c = conn.cursor()
-    now = datetime.now(UTC5)
-    if period == "today":
-        since = now.strftime("%Y-%m-%d")
-        rows = c.execute(
-            "SELECT type, payment_method, category, amount, comment, created_at "
-            "FROM transactions WHERE user_name=? AND created_at LIKE ? ORDER BY created_at",
-            (user_name, f"{since}%"),
-        ).fetchall()
-    elif period == "week":
-        week_start = (now - timedelta(days=now.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        rows = c.execute(
-            "SELECT type, payment_method, category, amount, comment, created_at "
-            "FROM transactions WHERE user_name=? AND created_at >= ? ORDER BY created_at",
-            (user_name, week_start.isoformat()),
-        ).fetchall()
-    else:  # month
-        since = now.strftime("%Y-%m")
-        rows = c.execute(
-            "SELECT type, payment_method, category, amount, comment, created_at "
-            "FROM transactions WHERE user_name=? AND created_at LIKE ? ORDER BY created_at",
-            (user_name, f"{since}%"),
-        ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        now = datetime.now(UTC5)
+        if period == "today":
+            since = now.strftime("%Y-%m-%d")
+            rows = c.execute(
+                "SELECT type, payment_method, category, amount, comment, created_at "
+                "FROM transactions WHERE user_name=? AND created_at LIKE ? ORDER BY created_at",
+                (user_name, f"{since}%"),
+            ).fetchall()
+        elif period == "week":
+            week_start = (now - timedelta(days=now.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            rows = c.execute(
+                "SELECT type, payment_method, category, amount, comment, created_at "
+                "FROM transactions WHERE user_name=? AND created_at >= ? ORDER BY created_at",
+                (user_name, week_start.isoformat()),
+            ).fetchall()
+        else:  # month
+            since = now.strftime("%Y-%m")
+            rows = c.execute(
+                "SELECT type, payment_method, category, amount, comment, created_at "
+                "FROM transactions WHERE user_name=? AND created_at LIKE ? ORDER BY created_at",
+                (user_name, f"{since}%"),
+            ).fetchall()
     return rows
 
 
 # ── Cards ──
 def get_cards(user_name: str) -> list:
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT id, card_name, card_number, balance FROM cards "
-        "WHERE user_name=? ORDER BY id",
-        (user_name,),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT id, card_name, card_number, balance FROM cards "
+            "WHERE user_name=? ORDER BY id",
+            (user_name,),
+        ).fetchall()
     return rows  # [(id, name, number, balance), ...]
 
 
 def add_card(user_name: str, card_name: str, card_number: str, balance: float):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO cards (user_name, card_name, card_number, balance, created_at) "
-        "VALUES (?,?,?,?,?)",
-        (user_name, card_name, card_number, balance, datetime.now(UTC5).isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO cards (user_name, card_name, card_number, balance, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (user_name, card_name, card_number, balance, datetime.now(UTC5).isoformat()),
+        )
+        conn.commit()
 
 
 def update_card_balance(card_id: int, new_balance: float):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE cards SET balance=? WHERE id=?", (new_balance, card_id))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE cards SET balance=? WHERE id=?", (new_balance, card_id))
+        conn.commit()
 
 
 def delete_card(card_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM cards WHERE id=?", (card_id,))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM cards WHERE id=?", (card_id,))
+        conn.commit()
 
 
 def get_card_by_id(card_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT id, card_name, card_number, balance FROM cards WHERE id=?", (card_id,)
-    ).fetchone()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT id, card_name, card_number, balance FROM cards WHERE id=?", (card_id,)
+        ).fetchone()
     return row
 
 
 def adjust_card_balance(card_id: int, delta: float):
     """Karta balansini atomik o'zgartiradi (delta < 0 — ayirish)."""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE cards SET balance = balance + ? WHERE id=?", (delta, card_id))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE cards SET balance = balance + ? WHERE id=?", (delta, card_id))
+        conn.commit()
 
 
 # ─── Recurring Payments (Eslatmalar) ─────────────────────────────────────────
 def add_recurring(user_name, title, amount, day, payment_method, category, card_id=None):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO recurring_payments "
-        "(user_name, title, amount, day, payment_method, category, card_id, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (user_name, title, amount, day, payment_method, category, card_id,
-         datetime.now(UTC5).isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO recurring_payments "
+            "(user_name, title, amount, day, payment_method, category, card_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (user_name, title, amount, day, payment_method, category, card_id,
+             datetime.now(UTC5).isoformat()),
+        )
+        conn.commit()
 
 
 def get_recurring(user_name: str) -> list:
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
-        "FROM recurring_payments WHERE user_name=? ORDER BY day, id",
-        (user_name,),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
+            "FROM recurring_payments WHERE user_name=? ORDER BY day, id",
+            (user_name,),
+        ).fetchall()
     return rows
 
 
 def get_recurring_by_id(rec_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
-        "FROM recurring_payments WHERE id=?",
-        (rec_id,),
-    ).fetchone()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
+            "FROM recurring_payments WHERE id=?",
+            (rec_id,),
+        ).fetchone()
     return row
 
 
 def delete_recurring(rec_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM recurring_payments WHERE id=?", (rec_id,))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM recurring_payments WHERE id=?", (rec_id,))
+        conn.commit()
 
 
 def set_recurring_paid(rec_id: int, ym: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE recurring_payments SET last_paid_ym=? WHERE id=?", (ym, rec_id))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE recurring_payments SET last_paid_ym=? WHERE id=?", (ym, rec_id))
+        conn.commit()
 
 
 def get_recurring_due(today_day: int, last_day: int, ym: str) -> list:
     """Bugun eslatilishi kerak bo'lganlar: kuni to'g'ri kelgan yoki
     (oy qisqa bo'lsa) oyning oxirgi kunida day > last_day bo'lganlar."""
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
-        "FROM recurring_payments "
-        "WHERE last_paid_ym <> ? AND (day = ? OR (? = ? AND day > ?))",
-        (ym, today_day, today_day, last_day, last_day),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT id, user_name, title, amount, day, payment_method, category, card_id, last_paid_ym "
+            "FROM recurring_payments "
+            "WHERE last_paid_ym <> ? AND (day = ? OR (? = ? AND day > ?))",
+            (ym, today_day, today_day, last_day, last_day),
+        ).fetchall()
     return rows
 
 
@@ -539,38 +571,35 @@ def record_recurring_payment(rec, ym: str) -> int:
 
 # ─── Wallet (AVO / Naqd) Helpers ─────────────────────────────────────────────
 def get_wallet_balance(user_name: str, wallet_type: str) -> float:
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT balance FROM wallets WHERE user_name=? AND wallet_type=?",
-        (user_name, wallet_type),
-    ).fetchone()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT balance FROM wallets WHERE user_name=? AND wallet_type=?",
+            (user_name, wallet_type),
+        ).fetchone()
     return row[0] if row else 0.0
 
 
 def set_wallet_balance(user_name: str, wallet_type: str, balance: float):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (?,?,?) "
-        "ON CONFLICT(user_name, wallet_type) DO UPDATE SET balance=excluded.balance",
-        (user_name, wallet_type, balance),
-    )
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (?,?,?) "
+            "ON CONFLICT(user_name, wallet_type) DO UPDATE SET balance=excluded.balance",
+            (user_name, wallet_type, balance),
+        )
+        conn.commit()
 
 
 def adjust_wallet(user_name: str, wallet_type: str, delta: float):
     """delta < 0 harajat, delta > 0 kirim uchun. Atomik UPDATE."""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE wallets SET balance = balance + ? WHERE user_name=? AND wallet_type=?",
-        (delta, user_name, wallet_type),
-    )
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE wallets SET balance = balance + ? WHERE user_name=? AND wallet_type=?",
+            (delta, user_name, wallet_type),
+        )
+        conn.commit()
 
 
 def payment_to_wallet_type(payment_method: str):
@@ -586,90 +615,83 @@ def payment_to_wallet_type(payment_method: str):
 
 
 def save_setting(key: str, value: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+        conn.commit()
 
 
 def get_setting(key: str):
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row[0] if row else None
 
 
 def register_user(telegram_id: int, display_name: str):
     """Settings, users va naqd hamyonini bitta ulanish/tranzaksiyada yozadi."""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
-              (f"user_{telegram_id}", display_name))
-    now_str = datetime.now(UTC5).isoformat()
-    if DATABASE_URL:
-        c.execute(
-            "INSERT INTO users (telegram_id, display_name, created_at) VALUES (%s,%s,%s) "
-            "ON CONFLICT (telegram_id) DO UPDATE SET display_name = EXCLUDED.display_name",
-            (telegram_id, display_name, now_str),
-        )
-        c.execute(
-            "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (%s,%s,0) "
-            "ON CONFLICT (user_name, wallet_type) DO NOTHING",
-            (display_name, "naqd"),
-        )
-    else:
-        c.execute(
-            "INSERT OR REPLACE INTO users (telegram_id, display_name, created_at) VALUES (?,?,?)",
-            (telegram_id, display_name, now_str),
-        )
-        c.execute(
-            "INSERT OR IGNORE INTO wallets (user_name, wallet_type, balance) VALUES (?,?,0)",
-            (display_name, "naqd"),
-        )
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
+                  (f"user_{telegram_id}", display_name))
+        now_str = datetime.now(UTC5).isoformat()
+        if DATABASE_URL:
+            c.execute(
+                "INSERT INTO users (telegram_id, display_name, created_at) VALUES (%s,%s,%s) "
+                "ON CONFLICT (telegram_id) DO UPDATE SET display_name = EXCLUDED.display_name",
+                (telegram_id, display_name, now_str),
+            )
+            c.execute(
+                "INSERT INTO wallets (user_name, wallet_type, balance) VALUES (%s,%s,0) "
+                "ON CONFLICT (user_name, wallet_type) DO NOTHING",
+                (display_name, "naqd"),
+            )
+        else:
+            c.execute(
+                "INSERT OR REPLACE INTO users (telegram_id, display_name, created_at) VALUES (?,?,?)",
+                (telegram_id, display_name, now_str),
+            )
+            c.execute(
+                "INSERT OR IGNORE INTO wallets (user_name, wallet_type, balance) VALUES (?,?,0)",
+                (display_name, "naqd"),
+            )
+        conn.commit()
 
 
 def get_user_name(telegram_id: int) -> str:
     """Returns display_name or None if not registered."""
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute("SELECT display_name FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        row = c.execute("SELECT display_name FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
     return row[0] if row else None
 
 
 def get_user_telegram_id(display_name: str):
     """display_name bo'yicha telegram_id (eslatma yuborish uchun)."""
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT telegram_id FROM users WHERE display_name=?", (display_name,)
-    ).fetchone()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT telegram_id FROM users WHERE display_name=?", (display_name,)
+        ).fetchone()
     return row[0] if row else None
 
 
 def get_all_user_names() -> list:
     """Returns list of all registered user display names."""
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("SELECT display_name FROM users ORDER BY created_at").fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute("SELECT display_name FROM users ORDER BY created_at").fetchall()
     return [r[0] for r in rows]
 
 
 # ─── Channel Data Helpers ─────────────────────────────────────────────────────
 def get_all_cards_summary() -> dict:
     """Returns {user_name: [(card_name, card_number, balance), ...]}."""
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT user_name, card_name, card_number, balance FROM cards ORDER BY user_name, id"
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT user_name, card_name, card_number, balance FROM cards ORDER BY user_name, id"
+        ).fetchall()
     result: dict = {}
     for user, name, number, balance in rows:
         result.setdefault(user, []).append((name, number, balance))
@@ -678,14 +700,13 @@ def get_all_cards_summary() -> dict:
 
 def get_month_totals(ym: str) -> dict:
     """{user: {'kirim': x, 'harajat': y}} — YYYY-MM oyi bo'yicha."""
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT user_name, type, SUM(amount) FROM transactions "
-        "WHERE created_at LIKE ? GROUP BY user_name, type",
-        (f"{ym}%",),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT user_name, type, SUM(amount) FROM transactions "
+            "WHERE created_at LIKE ? GROUP BY user_name, type",
+            (f"{ym}%",),
+        ).fetchall()
     result: dict = {}
     for user, ttype, total in rows:
         result.setdefault(user, {"kirim": 0, "harajat": 0})[ttype] = total or 0
@@ -694,55 +715,51 @@ def get_month_totals(ym: str) -> dict:
 
 def get_month_categories(ym: str) -> list:
     """[(category, total)] — harajatlar, kamayish tartibida."""
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT category, SUM(amount) FROM transactions "
-        "WHERE type='harajat' AND created_at LIKE ? "
-        "GROUP BY category ORDER BY SUM(amount) DESC",
-        (f"{ym}%",),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT category, SUM(amount) FROM transactions "
+            "WHERE type='harajat' AND created_at LIKE ? "
+            "GROUP BY category ORDER BY SUM(amount) DESC",
+            (f"{ym}%",),
+        ).fetchall()
     return rows
 
 
 def get_month_top_expenses(ym: str, limit: int = 5) -> list:
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT user_name, category, amount, comment FROM transactions "
-        "WHERE type='harajat' AND created_at LIKE ? "
-        "ORDER BY amount DESC LIMIT ?",
-        (f"{ym}%", limit),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT user_name, category, amount, comment FROM transactions "
+            "WHERE type='harajat' AND created_at LIKE ? "
+            "ORDER BY amount DESC LIMIT ?",
+            (f"{ym}%", limit),
+        ).fetchall()
     return rows
 
 
 def get_transactions_for_month(user_name: str, ym: str) -> list:
     """CSV eksport uchun: bitta user, YYYY-MM oyi."""
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT created_at, type, payment_method, category, amount, comment "
-        "FROM transactions WHERE user_name=? AND created_at LIKE ? ORDER BY created_at",
-        (user_name, f"{ym}%"),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT created_at, type, payment_method, category, amount, comment "
+            "FROM transactions WHERE user_name=? AND created_at LIKE ? ORDER BY created_at",
+            (user_name, f"{ym}%"),
+        ).fetchall()
     return rows
 
 
 def get_today_transactions_all(target_date: str = None) -> dict:
     """Returns {user_name: [(type, payment, category, amount, comment), ...]}."""
-    conn = get_conn()
-    c = conn.cursor()
-    date_key = target_date if target_date else datetime.now(UTC5).strftime("%Y-%m-%d")
-    rows = c.execute(
-        "SELECT user_name, type, payment_method, category, amount, comment "
-        "FROM transactions WHERE created_at LIKE ? ORDER BY user_name, created_at",
-        (f"{date_key}%",),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        c = conn.cursor()
+        date_key = target_date if target_date else datetime.now(UTC5).strftime("%Y-%m-%d")
+        rows = c.execute(
+            "SELECT user_name, type, payment_method, category, amount, comment "
+            "FROM transactions WHERE created_at LIKE ? ORDER BY user_name, created_at",
+            (f"{date_key}%",),
+        ).fetchall()
     result: dict = {}
     for user, typ, pay, cat, amt, cmt in rows:
         result.setdefault(user, []).append((typ, pay, cat, amt, cmt or ""))
@@ -815,7 +832,7 @@ def build_channel_text(is_evening: bool = False, target_date: str = None) -> str
             user_exp = 0
             lines.append("📤 _Harajatlar:_")
             for i, (pay, cat, amt, cmt) in enumerate(expenses, 1):
-                cmt_str = f"\n   └ _{cmt}_" if cmt else ""
+                cmt_str = f"\n   └ _{escape_markdown(cmt)}_" if cmt else ""
                 lines.append(f"*{i}.* `{format_amount(amt)}` — {cat}  ·  _[{pay}]_{cmt_str}")
                 user_exp      += amt
                 grand_expense += amt
@@ -824,7 +841,7 @@ def build_channel_text(is_evening: bool = False, target_date: str = None) -> str
             user_inc = 0
             lines.append("📥 _Kirimlar:_")
             for i, (pay, cat, amt, cmt) in enumerate(incomes, 1):
-                cmt_str = f"\n   └ _{cmt}_" if cmt else ""
+                cmt_str = f"\n   └ _{escape_markdown(cmt)}_" if cmt else ""
                 lines.append(f"*{i}.* `{format_amount(amt)}` — {cat}  ·  _[{pay}]_{cmt_str}")
                 user_inc     += amt
                 grand_income += amt
@@ -901,7 +918,7 @@ def build_monthly_report_text(ym: str, prev_ym: str) -> str:
     if top:
         lines.append("🏆 *TOP-5 eng katta harajat:*\n")
         for i, (user, cat, amount, cmt) in enumerate(top, 1):
-            cmt_str = f" · _{cmt}_" if cmt else ""
+            cmt_str = f" · _{escape_markdown(cmt)}_" if cmt else ""
             lines.append(f"*{i}.* `{format_amount(amount)}` — {cat} ({user}){cmt_str}")
 
     text = "\n".join(lines)
@@ -1236,6 +1253,23 @@ def parse_date(date_str: str):
         return None
 
 
+def sanitize_md_input(text: str, maxlen: int = 64) -> str:
+    """Foydalanuvchi kiritadigan nom/sarlavhalardan Markdown belgilarini
+    olib tashlaydi — aks holda shu nom ishtirok etgan har bir xabar
+    'Can't parse entities' bilan yiqiladi."""
+    return re.sub(r"[*_`\[\]]", "", text).strip()[:maxlen]
+
+
+def ensure_user_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Restartdan keyin ctx.user_data bo'shab qoladi — ismni DB'dan tiklaydi."""
+    name = ctx.user_data.get("user_name")
+    if not name and update.effective_user:
+        name = get_user_name(update.effective_user.id)
+        if name:
+            ctx.user_data["user_name"] = name
+    return name
+
+
 _QUICK_RE = re.compile(r"^(\+?)\s*(\d[\d\s.,]*)\s*(.*)$", re.S)
 
 def parse_quick_entry(text: str):
@@ -1323,7 +1357,7 @@ def build_detailed_report(user_name: str, period: str, period_label: str, ctx) -
             lines.append(f"\n📤 *{exp_label}:*")
             day_exp = 0
             for i, (payment, category, amount, comment) in enumerate(expenses, 1):
-                comment_str = f"\n    └ _{comment}_" if comment else ""
+                comment_str = f"\n    └ _{escape_markdown(comment)}_" if comment else ""
                 lines.append(
                     f"*{i}.* `{format_amount(amount)}` — {category}"
                     f"  ·  _[{payment}]_{comment_str}"
@@ -1336,7 +1370,7 @@ def build_detailed_report(user_name: str, period: str, period_label: str, ctx) -
             lines.append(f"\n📥 *{inc_label}:*")
             day_inc = 0
             for i, (payment, category, amount, comment) in enumerate(incomes, 1):
-                comment_str = f"\n    └ _{comment}_" if comment else ""
+                comment_str = f"\n    └ _{escape_markdown(comment)}_" if comment else ""
                 lines.append(
                     f"*{i}.* `{format_amount(amount)}` — {category}"
                     f"  ·  _[{payment}]_{comment_str}"
@@ -1687,8 +1721,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def msg_register_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    display_name = update.message.text.strip().upper()
-    
+    display_name = sanitize_md_input(update.message.text, maxlen=32).upper()
+    if not display_name:
+        await update.message.reply_text(
+            "Iltimos, ismingizni oddiy harflar bilan kiriting (masalan: ORZU):"
+        )
+        return REGISTER_NAME
+
     register_user(user_id, display_name)
     ctx.user_data["user_name"] = display_name
     
@@ -1704,6 +1743,14 @@ async def msg_register_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Main Menu ──
 async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # Entry point sifatida ham chaqiriladi (restartdan keyin eski tugmalar) —
+    # shuning uchun ruxsat va user_name shu yerda tekshiriladi/tiklanadi
+    if update.effective_user.id not in ALLOWED_USER_IDS:
+        await query.answer("🚫 Kirish taqiqlangan!", show_alert=True)
+        return ConversationHandler.END
+    if not ensure_user_name(update, ctx):
+        await query.answer("Avval /start bosing", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
     data = query.data
 
@@ -1817,6 +1864,10 @@ async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Quick Entry ──
 async def msg_quick_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Bosh menyuda oddiy matn: '50000 taksi' → tez kiritish oqimi."""
+    if not ensure_user_name(update, ctx):
+        await update.message.reply_text("Avval /start bosib ro'yxatdan o'ting.")
+        return ConversationHandler.END
+
     parsed = parse_quick_entry(update.message.text)
     if not parsed:
         await update.message.reply_text(
@@ -1833,7 +1884,7 @@ async def msg_quick_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("custom_date_display", None)
 
     type_emoji = "💰" if trans_type == "kirim" else "💸"
-    cmt_note   = f" · _{comment}_" if comment else ""
+    cmt_note   = f" · _{escape_markdown(comment)}_" if comment else ""
     prefix     = "inc_pay_" if trans_type == "kirim" else "exp_pay_"
     await update.message.reply_text(
         f"{type_emoji} *{format_amount(amount)}*{cmt_note}\n\n{t('payment_method', ctx)}",
@@ -2292,20 +2343,32 @@ async def _finalize_save_from_callback(query, ctx):
 
 async def cb_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Saqlangan tranzaksiyani bekor qiladi: yozuv o'chadi, balans qaytadi."""
-    query     = update.callback_query
-    user_name = ctx.user_data.get("user_name", "?")
-    txn_id    = int(query.data.split("undo_")[1])
+    query = update.callback_query
+    # Entry point sifatida ham ishlaydi (restartdan keyingi eski tugma)
+    if update.effective_user.id not in ALLOWED_USER_IDS:
+        await query.answer("🚫 Kirish taqiqlangan!", show_alert=True)
+        return ConversationHandler.END
+    user_name = ensure_user_name(update, ctx)
+    if not user_name:
+        await query.answer("Avval /start bosing", show_alert=True)
+        return ConversationHandler.END
+    # Avval javob beramiz — DB sekinlashsa ham tugma "osilib" qolmasin
+    await query.answer()
+    txn_id = int(query.data.split("undo_")[1])
 
     row = delete_transaction_and_refund(txn_id, user_name)
     if row is None:
-        await query.answer(t("undo_gone", ctx), show_alert=True)
         try:
-            await query.edit_message_reply_markup(reply_markup=kb_main(ctx))
+            await query.edit_message_text(
+                f"ℹ️ {t('undo_gone', ctx)}\n\n"
+                f"👤 *{user_name}* · 📋 {t('main_menu', ctx)}",
+                parse_mode="Markdown",
+                reply_markup=kb_main(ctx),
+            )
         except Exception:
             pass  # xabar allaqachon o'zgartirilgan bo'lishi mumkin
         return MAIN_MENU
 
-    await query.answer()
     _, _, trans_type, payment_method, category, amount, _, created_at = row
     type_emoji = "💸" if trans_type == "harajat" else "💰"
     menu_label = t("main_menu", ctx)
@@ -2638,7 +2701,14 @@ async def cb_rec_back_to_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def msg_rec_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["new_rec_title"] = update.message.text.strip()
+    title = sanitize_md_input(update.message.text)
+    if not title:
+        await update.message.reply_text(
+            t("rec_title_prompt", ctx), parse_mode="Markdown",
+            reply_markup=kb_back(ctx, "rec_back"),
+        )
+        return REC_ADD_TITLE
+    ctx.user_data["new_rec_title"] = title
     await update.message.reply_text(
         t("rec_amount_prompt", ctx), parse_mode="Markdown",
         reply_markup=kb_back(ctx, "rec_back"),
@@ -2856,7 +2926,13 @@ async def cb_card_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def msg_card_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
+    name = sanitize_md_input(update.message.text)
+    if not name:
+        await update.message.reply_text(
+            t("card_add_name", ctx), parse_mode="Markdown",
+            reply_markup=kb_back(ctx, "card_back_list"),
+        )
+        return CARD_ADD_NAME
     ctx.user_data["new_card_name"] = name
     await update.message.reply_text(
         t("card_add_number", ctx), parse_mode="Markdown",
@@ -2866,7 +2942,7 @@ async def msg_card_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def msg_card_add_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = sanitize_md_input(update.message.text, maxlen=20)
     ctx.user_data["new_card_number"] = text
     await update.message.reply_text(
         t("card_add_balance", ctx), parse_mode="Markdown",
@@ -3056,6 +3132,36 @@ async def cb_card_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     return CARD_DELETE_CONFIRM
 
 
+async def cb_session_expired(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Restartdan keyin suhbat holati yo'qolgan eski tugmalar uchun entry point:
+    spinner qoldirmasdan javob berib, yangi bosh menyu ochadi."""
+    query = update.callback_query
+    if update.effective_user.id not in ALLOWED_USER_IDS:
+        await query.answer("🚫 Kirish taqiqlangan!", show_alert=True)
+        return ConversationHandler.END
+    user_name = ensure_user_name(update, ctx)
+    if not user_name:
+        await query.answer("Avval /start bosing", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    text = (
+        f"👤 *{user_name}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"♻️ Bot yangilangan edi — menyu qaytadan ochildi\n\n"
+        f"📋 {t('main_menu', ctx)}"
+    )
+    try:
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=kb_main(ctx)
+        )
+    except Exception:
+        # Juda eski xabarni edit qilib bo'lmaydi — yangisini yuboramiz
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id, text=text,
+            parse_mode="Markdown", reply_markup=kb_main(ctx),
+        )
+    return MAIN_MENU
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 async def _post_init(application):
     """Bot ishga tushganda har bir foydalanuvchiga welcome xabar yuboradi."""
@@ -3102,6 +3208,13 @@ def main():
             "BOT_TOKEN topilmadi! Uni .env fayliga yoki "
             "Heroku Settings → Config Vars ga qo'shing."
         )
+    # Prod bot Heroku'da polling qilib turibdi; ikkinchi instansiya bir xil
+    # token bilan ishga tushsa Telegram Conflict beradi (bot "qotadi")
+    if not os.environ.get("DYNO") and os.environ.get("FORCE_LOCAL") != "1":
+        raise SystemExit(
+            "Bot prod'da (Heroku worker) ishlayapti — lokal polling u bilan "
+            "to'qnashadi. Baribir kerak bo'lsa: FORCE_LOCAL=1 python bot.py"
+        )
     init_db()
     app = (
         Application.builder()
@@ -3112,7 +3225,21 @@ def main():
     app.add_error_handler(error_handler)
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start, filters=filters.User(list(ALLOWED_USER_IDS)))],
+        entry_points=[
+            CommandHandler("start", cmd_start, filters=filters.User(list(ALLOWED_USER_IDS))),
+            # Restart suhbat holatini o'chiradi (persistence yo'q) — eski
+            # tugmalar va matnlar shu entry'lar orqali qayta ishlay boshlaydi
+            CallbackQueryHandler(cb_main_menu, pattern="^(menu_|report_|change_)"),
+            CallbackQueryHandler(cb_undo, pattern=r"^undo_\d+$"),
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND & filters.User(list(ALLOWED_USER_IDS)),
+                msg_quick_entry,
+            ),
+            # Oqim o'rtasidagi eski tugmalar (exp_/trf_/card_...) — davom
+            # ettirib bo'lmaydi (ma'lumot yo'qolgan), yangi menyu ochamiz.
+            # rec_pay/rec_skip bundan mustasno — ular global handlerda
+            CallbackQueryHandler(cb_session_expired, pattern=r"^(?!rec_(?:pay|skip)_)"),
+        ],
         states={
             REGISTER_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_register_name),
@@ -3278,6 +3405,9 @@ def main():
                 await update.callback_query.answer("🚫 Kirish taqiqlangan!", show_alert=True)
             elif update.message:
                 await update.message.reply_text("🚫 Sizda bu botdan foydalanish huquqi yo'q.")
+        elif update.callback_query:
+            # Ruxsatli user'ning egasiz tugmasi — spinner qolib ketmasin
+            await update.callback_query.answer()
 
     app.add_handler(
         MessageHandler(~filters.User(list(ALLOWED_USER_IDS)), _unauthorized)
@@ -3311,7 +3441,8 @@ def main():
         name="monthly_report",
     )
     logger.info("Finance Bot ishga tushdi ✅ | Kanal xabarlari rejalashtirildi")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # drop_pending_updates=False: restart oynasida yozilgan xabarlar yo'qolmasin
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":

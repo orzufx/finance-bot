@@ -22,13 +22,24 @@ def get_pg_pool():
     if _pg_pool is None and DATABASE_URL:
         from psycopg2.pool import ThreadedConnectionPool
         # bot.py + server.py birgalikda Heroku'ning 20 talik ulanish
-        # cheklovidan oshmasligi uchun har biriga maksimum 5 ta
-        _pg_pool = ThreadedConnectionPool(1, 5, DATABASE_URL, sslmode='require')
+        # cheklovidan oshmasligi uchun har biriga maksimum 5 ta.
+        # Timeout/keepalive'lar — o'lik ulanishda so'rov osilib qolmasligi uchun
+        _pg_pool = ThreadedConnectionPool(
+            1, 5, DATABASE_URL,
+            sslmode='require',
+            connect_timeout=5,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
+            options='-c statement_timeout=15000',
+        )
     return _pg_pool
 
 class PostgresConnWrapper:
     def __init__(self, conn):
         self._conn = conn
+        self._returned = False
     def cursor(self):
         return self._conn.cursor()
     def commit(self):
@@ -36,14 +47,35 @@ class PostgresConnWrapper:
     def rollback(self):
         self._conn.rollback()
     def close(self):
-        if DATABASE_URL:
+        # Idempotent: ikki marta chaqirilsa ham pool buzilmaydi
+        if self._returned:
+            return
+        self._returned = True
+        try:
             get_pg_pool().putconn(self._conn)
-        else:
-            self._conn.close()
+        except Exception:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
 def get_conn():
     if DATABASE_URL:
-        conn = get_pg_pool().getconn()
+        pool = get_pg_pool()
+        conn = pool.getconn()
+        # O'lik pooled ulanishni ping bilan aniqlab, yangisiga almashtiramiz
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            conn.rollback()
+        except Exception:
+            logging.warning("O'lik PG ulanish topildi — yangisiga almashtirildi")
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            conn = pool.getconn()
         return PostgresConnWrapper(conn)
     else:
         return sqlite3.connect("finance.db")
